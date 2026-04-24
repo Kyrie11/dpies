@@ -1,0 +1,9 @@
+cache_dir: ./cache/val
+checkpoint: ./runs/dpies_main/best.pt
+output_dir: ./runs/dpies_main/eval
+budgets: [4, 8, 16, 24, 32, 48, 64]
+top_m: 4
+eta_e: 0.05
+gamma0: 1.0
+batch_size: 4
+num_workers: 4

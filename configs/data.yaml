@@ -1,0 +1,15 @@
+data_root: /data0/senzeyu2/dataset/nuplan/data/cache
+map_root: /data0/senzeyu2/dataset/nuplan/maps
+train_subdirs: [train_boston, train_singapore, train_pittsburgh, train_vegas_2]
+val_subdirs: [val]
+history_seconds: 2.0
+future_seconds: 8.0
+dt: 0.5
+sample_interval_seconds: 1.0
+max_agents: 64
+max_map_polylines: 256
+max_map_points: 20
+map_radius_m: 80.0
+max_actions: 32
+max_evidence_units: 128
+agent_radius_m: 80.0

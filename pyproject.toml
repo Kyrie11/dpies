@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dpies-nuplan"
+version = "0.1.0"
+description = "Decision-Preserving Interaction Evidence Selection on nuPlan DB data"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["dpies*"]

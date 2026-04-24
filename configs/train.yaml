@@ -1,0 +1,41 @@
+data:
+  train_cache_dir: ./cache/train
+  val_cache_dir: ./cache/val
+  num_workers: 4
+  batch_size: 4
+model:
+  ego_dim: 8
+  agent_dim: 8
+  map_dim: 4
+  action_state_dim: 6
+  action_meta_dim: 8
+  evidence_dim: 32
+  query_dim: 24
+  num_action_modes: 9
+  num_evidence_types: 6
+  hidden_dim: 256
+  dropout: 0.1
+  pair_chunk_size: 64
+selection:
+  top_m: 4
+  budget: 32
+  eta_e: 0.05
+  gamma0: 1.0
+loss:
+  lambda_scr: 1.0
+  lambda_evi: 1.0
+  lambda_act: 1.0
+  lambda_hn: 0.5
+  positive_weight_alpha: 5.0
+  huber_delta: 1.0
+  tau_q: 1.0
+  action_margin: 0.5
+training:
+  epochs: 20
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 5.0
+  mixed_precision: true
+  seed: 7
+  log_interval: 20
+  save_interval_epochs: 1
