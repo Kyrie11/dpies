@@ -72,18 +72,22 @@ class NuPlanMapProvider(NullMapProvider):
         self._apis: Dict[str, Any] = {}
         self._warned: set[str] = set()
         self.available = False
+        self._init_error = ""
         try:
             from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
             from nuplan.common.actor_state.state_representation import Point2D
             from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+
             self._get_maps_api = get_maps_api
             self._Point2D = Point2D
             self._Layer = SemanticMapLayer
             self.available = True
         except Exception as exc:
-            obj = super().extract("__api_unavailable__", ego_xy, ego_yaw, radius_m)
-            obj.error = str(exc)
-            return obj
+            self._get_maps_api = None
+            self._Point2D = None
+            self._Layer = None
+            self._init_error = str(exc)
+            self.available = False
 
     def _api(self, map_name: str) -> Any:
         if map_name in self._apis:
@@ -221,7 +225,6 @@ class NuPlanMapProvider(NullMapProvider):
             "ROADBLOCK_CONNECTOR",
             "CROSSWALK",
             "STOP_LINE",
-            "WALKWAYS",
             "CARPARK_AREA",
             "LANE_BOUNDARY",
             "TRAFFIC_LIGHT_CONNECTOR",
@@ -239,42 +242,7 @@ class NuPlanMapProvider(NullMapProvider):
             return list(vals or [])
         return list(got or [])
 
-    def _safe_get_proximal_map_objects(
-            self,
-            map_api: Any,
-            ego_xy: np.ndarray,
-            radius_m: float,
-    ) -> dict[Any, list[Any]]:
-        """Layer-wise map query for official nuPlan v1.1 devkit.
 
-        One unsupported layer should not make the whole local HD map empty.
-        """
-        center = self._Point2D(float(ego_xy[0]), float(ego_xy[1]))
-        objects: dict[Any, list[Any]] = {}
-
-        for layer in self._layer_list():
-            lname = getattr(layer, "name", str(layer))
-            try:
-                objects[layer] = self._query_map_layer(map_api, center, radius_m, layer)
-            except Exception as exc:
-                self._warn_once(
-                    f"map_layer:{lname}",
-                    f"Skipping nuPlan map layer {lname}: {exc}",
-                )
-                objects[layer] = []
-
-        return objects
-
-    def _query_map_layer(self, map_api: Any, center: Any, radius_m: float, layer: Any) -> list[Any]:
-        """Query one nuPlan semantic map layer and normalize return formats."""
-        got = map_api.get_proximal_map_objects(center, radius_m, [layer])
-        if isinstance(got, dict):
-            vals = got.get(layer, None)
-            if vals is None:
-                # Some devkit versions / wrappers use layer.name or str(layer) keys.
-                vals = got.get(getattr(layer, "name", str(layer)), [])
-            return list(vals or [])
-        return list(got or [])
 
     def _safe_get_proximal_map_objects(
             self,
@@ -301,6 +269,58 @@ class NuPlanMapProvider(NullMapProvider):
                 objects[layer] = []
 
         return objects
+
+    @staticmethod
+    def _ensure_closed_polygon(xy: np.ndarray) -> np.ndarray:
+        xy = np.asarray(xy, dtype=np.float32)
+        if len(xy) >= 3 and not np.allclose(xy[0], xy[-1]):
+            xy = np.concatenate([xy, xy[:1]], axis=0)
+        return xy
+
+    @staticmethod
+    def _downsample_points(xy: np.ndarray, max_points: int) -> np.ndarray:
+        xy = np.asarray(xy, dtype=np.float32)
+        if max_points <= 0:
+            return xy
+        if len(xy) <= max_points:
+            return xy
+        idx = np.linspace(0, len(xy) - 1, max_points).astype(np.int64)
+        return xy[idx].astype(np.float32)
+
+    def _drivable_union_rule(self, polygons: list[np.ndarray]) -> dict[str, Any] | None:
+        """Build local drivable-area evidence from polygon-backed nuPlan layers.
+
+        Do not query SemanticMapLayer.DRIVABLE_AREA directly in nuPlan v1.1,
+        because it can be raster-backed / non-object-backed. Instead, synthesize
+        a local drivable proxy from lane, lane_connector, roadblock,
+        roadblock_connector and carpark polygons.
+        """
+        clean: list[np.ndarray] = []
+        for poly in polygons:
+            if poly is None:
+                continue
+            arr = np.asarray(poly, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) < 3:
+                continue
+            clean.append(self._ensure_closed_polygon(arr[:, :2]))
+
+        if not clean:
+            return None
+
+        pts = np.concatenate(clean, axis=0)
+        xy = pts.mean(axis=0).astype(np.float32)
+
+        return {
+            "layer": "DRIVABLE_AREA_UNION",
+            "rule_code": int(MapRuleCode.DRIVABLE_AREA),
+            "xy": xy.astype(float).tolist(),
+            "polyline": [],
+            "polygon": [],
+            "polygons": [p.astype(float).tolist() for p in clean[:128]],
+            "geometry_type": "multi_polygon",
+            "map_object_id": "drivable_area_union",
+            "hard_keep": True,
+        }
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -339,7 +359,8 @@ class NuPlanMapProvider(NullMapProvider):
         if not self.available:
             # Closed-loop can pass an already-created map_api even when map_root is not set.
             try:
-                from nuplan.common.maps.maps_datatypes import Point2D, SemanticMapLayer  # type: ignore
+                from nuplan.common.actor_state.state_representation import Point2D  # type: ignore
+                from nuplan.common.maps.maps_datatypes import SemanticMapLayer  # type: ignore
                 self._Point2D = Point2D
                 self._Layer = SemanticMapLayer
                 self.available = True
@@ -482,8 +503,8 @@ class NuPlanMapProvider(NullMapProvider):
                         "layer": "SPEED_LIMIT",
                         "rule_code": int(MapRuleCode.SPEED_LIMIT),
                         "xy": centroid.astype(float).tolist(),
-                        "polyline": keep.astype(float).tolist(),
-                        "polygon": keep.astype(float).tolist() if kind == "polygon" else [],
+                        "polyline": rule_line.astype(float).tolist(),
+                        "polygon": rule_poly.astype(float).tolist(),
                         "geometry_type": kind,
                         "map_object_id": obj_id,
                         "speed_limit_mps": float(speed_limit),
