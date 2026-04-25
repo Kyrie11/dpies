@@ -77,6 +77,9 @@ def _footprint_distance_and_overlap(action: np.ndarray, agent_xy: np.ndarray, ag
 def _points(value: Any) -> np.ndarray:
     try:
         arr = np.asarray(value, dtype=np.float32).reshape((-1, 2))
+        if len(arr) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        arr = arr[np.isfinite(arr).all(axis=1)]
         return arr if len(arr) else np.zeros((0, 2), dtype=np.float32)
     except Exception:
         return np.zeros((0, 2), dtype=np.float32)
@@ -119,6 +122,10 @@ def _make_polygon(pts: np.ndarray):
     if Polygon is None or len(pts) < 3:
         return None
     try:
+        pts = np.asarray(pts, dtype=np.float32).reshape((-1, 2))
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if len(pts) < 3:
+            return None
         poly = Polygon(pts)
         if not poly.is_valid:
             poly = poly.buffer(0)
@@ -131,6 +138,10 @@ def _make_line(pts: np.ndarray):
     if LineString is None or len(pts) < 2:
         return None
     try:
+        pts = np.asarray(pts, dtype=np.float32).reshape((-1, 2))
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if len(pts) < 2:
+            return None
         return LineString(pts)
     except Exception:
         return None
@@ -140,7 +151,11 @@ def _action_centerline(action: np.ndarray):
     if LineString is None or len(action) < 2:
         return None
     try:
-        return LineString(action[:, :2])
+        pts = np.asarray(action[:, :2], dtype=np.float32)
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if len(pts) < 2:
+            return None
+        return LineString(pts)
     except Exception:
         return None
 
@@ -149,8 +164,10 @@ def _ego_polygons(action: np.ndarray) -> list[Any]:
     if Polygon is None:
         return []
     polys = []
-    for st in action:
+    for st in np.asarray(action, dtype=np.float32):
         try:
+            if not np.isfinite(st[:3]).all():
+                continue
             p = Polygon(box_corners(float(st[0]), float(st[1]), float(st[2]), 4.8, 2.1))
             if p.is_valid and not p.is_empty:
                 polys.append(p)
