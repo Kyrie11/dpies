@@ -216,7 +216,7 @@ SAMPLE_INTERVAL_S=2.0 bash scripts/build_cache_val.sh
 python -m dpies.data.preprocess_nuplan \
   --data-root /data0/senzeyu2/dataset/nuplan/data/cache \
   --map-root /data0/senzeyu2/dataset/nuplan/maps \
-  --output-dir ./cache/train \
+  --output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train \
   --subdirs train_boston train_singapore train_pittsburgh train_vegas_2 \
   --sample-interval-s 1.0 \
   --history-seconds 2.0 \

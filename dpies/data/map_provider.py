@@ -73,16 +73,16 @@ class NuPlanMapProvider(NullMapProvider):
         self._warned: set[str] = set()
         self.available = False
         try:
-            from nuplan.common.maps.nuplan_map.map_factory import get_maps_api  # type: ignore
-            from nuplan.common.actor_state.state_representation import Point2D  # type: ignore
-            from nuplan.common.maps.maps_datatypes import SemanticMapLayer  # type: ignore
-            self._get_maps_api = get_maps_api
+            from nuplan.common.actor_state.state_representation import Point2D
+            from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+
             self._Point2D = Point2D
             self._Layer = SemanticMapLayer
             self.available = True
         except Exception as exc:
-            self.available = False
-            self._init_error = str(exc)
+            obj = super().extract("__api_unavailable__", ego_xy, ego_yaw, radius_m)
+            obj.error = str(exc)
+            return obj
 
     def _api(self, map_name: str) -> Any:
         if map_name in self._apis:
@@ -152,8 +152,17 @@ class NuPlanMapProvider(NullMapProvider):
         """Return ('polygon'|'polyline', global xy coords) when possible."""
         u = layer.upper()
         # Prefer true polygons for area-like objects; prefer lines for stop/boundary.
-        polygon_attrs = ("polygon", "exterior_polygon")
-        line_attrs = ("baseline_path", "centerline", "linestring")
+        polygon_attrs = (
+            "polygon",
+            "exterior_polygon",
+        )
+        line_attrs = (
+            "baseline_path",
+            "centerline",
+            "linestring",
+            "left_boundary",
+            "right_boundary",
+        )
         attr_order = line_attrs if ("STOP" in u or "BOUNDARY" in u) else polygon_attrs + line_attrs
         for attr in attr_order:
             try:
@@ -190,18 +199,107 @@ class NuPlanMapProvider(NullMapProvider):
             return int(MapRuleCode.INTERSECTION)
         return int(MapRuleCode.NONE)
 
-    def _layer_list(self) -> list[Any]:
-        names = [
-            "LANE", "LANE_CONNECTOR", "ROADBLOCK", "ROADBLOCK_CONNECTOR",
-            "CROSSWALK", "STOP_LINE", "WALKWAYS", "CARPARK_AREA",
-            "DRIVABLE_AREA", "LANE_BOUNDARY", "TRAFFIC_LIGHT_CONNECTOR",
-            "INTERSECTION",
-        ]
-        layers = []
+    def _layers_by_name(self, names: Sequence[str]) -> list[Any]:
+        layers: list[Any] = []
         for name in names:
             if hasattr(self._Layer, name):
                 layers.append(getattr(self._Layer, name))
         return layers
+
+    def _layer_list(self) -> list[Any]:
+        """Object-backed layers safe to query in nuPlan v1.1.
+
+        Do not request DRIVABLE_AREA here. In official nuPlan v1.1 devkit,
+        SemanticMapLayer.DRIVABLE_AREA may exist as an enum but often has no
+        object representation through get_proximal_map_objects().
+        """
+        return self._layers_by_name([
+            "LANE",
+            "LANE_CONNECTOR",
+            "ROADBLOCK",
+            "ROADBLOCK_CONNECTOR",
+            "CROSSWALK",
+            "STOP_LINE",
+            "WALKWAYS",
+            "CARPARK_AREA",
+            "LANE_BOUNDARY",
+            "TRAFFIC_LIGHT_CONNECTOR",
+            "INTERSECTION",
+        ])
+
+    def _query_map_layer(self, map_api: Any, center: Any, radius_m: float, layer: Any) -> list[Any]:
+        """Query one nuPlan semantic map layer and normalize return formats."""
+        got = map_api.get_proximal_map_objects(center, radius_m, [layer])
+        if isinstance(got, dict):
+            vals = got.get(layer, None)
+            if vals is None:
+                # Some devkit versions / wrappers use layer.name or str(layer) keys.
+                vals = got.get(getattr(layer, "name", str(layer)), [])
+            return list(vals or [])
+        return list(got or [])
+
+    def _safe_get_proximal_map_objects(
+            self,
+            map_api: Any,
+            ego_xy: np.ndarray,
+            radius_m: float,
+    ) -> dict[Any, list[Any]]:
+        """Layer-wise map query for official nuPlan v1.1 devkit.
+
+        One unsupported layer should not make the whole local HD map empty.
+        """
+        center = self._Point2D(float(ego_xy[0]), float(ego_xy[1]))
+        objects: dict[Any, list[Any]] = {}
+
+        for layer in self._layer_list():
+            lname = getattr(layer, "name", str(layer))
+            try:
+                objects[layer] = self._query_map_layer(map_api, center, radius_m, layer)
+            except Exception as exc:
+                self._warn_once(
+                    f"map_layer:{lname}",
+                    f"Skipping nuPlan map layer {lname}: {exc}",
+                )
+                objects[layer] = []
+
+        return objects
+
+    def _query_map_layer(self, map_api: Any, center: Any, radius_m: float, layer: Any) -> list[Any]:
+        """Query one nuPlan semantic map layer and normalize return formats."""
+        got = map_api.get_proximal_map_objects(center, radius_m, [layer])
+        if isinstance(got, dict):
+            vals = got.get(layer, None)
+            if vals is None:
+                # Some devkit versions / wrappers use layer.name or str(layer) keys.
+                vals = got.get(getattr(layer, "name", str(layer)), [])
+            return list(vals or [])
+        return list(got or [])
+
+    def _safe_get_proximal_map_objects(
+            self,
+            map_api: Any,
+            ego_xy: np.ndarray,
+            radius_m: float,
+    ) -> dict[Any, list[Any]]:
+        """Layer-wise map query for official nuPlan v1.1 devkit.
+
+        One unsupported layer should not make the whole local HD map empty.
+        """
+        center = self._Point2D(float(ego_xy[0]), float(ego_xy[1]))
+        objects: dict[Any, list[Any]] = {}
+
+        for layer in self._layer_list():
+            lname = getattr(layer, "name", str(layer))
+            try:
+                objects[layer] = self._query_map_layer(map_api, center, radius_m, layer)
+            except Exception as exc:
+                self._warn_once(
+                    f"map_layer:{lname}",
+                    f"Skipping nuPlan map layer {lname}: {exc}",
+                )
+                objects[layer] = []
+
+        return objects
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -249,7 +347,7 @@ class NuPlanMapProvider(NullMapProvider):
                 obj.error = str(exc)
                 return obj
         try:
-            objects = map_api.get_proximal_map_objects(self._Point2D(float(ego_xy[0]), float(ego_xy[1])), radius_m, self._layer_list())
+            objects = self._safe_get_proximal_map_objects(map_api, ego_xy, radius_m)
         except Exception as exc:
             err = str(exc)
             self._warn_once("extract_from_api", f"Map extraction from supplied API failed: {err}")
@@ -268,6 +366,7 @@ class NuPlanMapProvider(NullMapProvider):
         rule_units: List[dict] = []
         route_polygons: list[list[list[float]]] = []
         route_polyline_centers: list[list[list[float]]] = []
+        drivable_polygons: list[np.ndarray] = []
         n = 0
 
         try:
@@ -287,12 +386,39 @@ class NuPlanMapProvider(NullMapProvider):
                 kind, xy_global = self._geometry_from_obj(obj, layer)
                 if xy_global is None or len(xy_global) < 2:
                     continue
-                xy_e = global_to_ego_points(xy_global, ego_xy, ego_yaw)
-                keep_idx = np.linspace(0, len(xy_e) - 1, min(len(xy_e), self.max_points)).astype(int)
-                keep = xy_e[keep_idx]
+                xy_e_full = global_to_ego_points(xy_global, ego_xy, ego_yaw).astype(np.float32)
+
+                if kind == "polygon":
+                    xy_e_full = self._ensure_closed_polygon(xy_e_full)
+
+                # Encoder tensor can stay compact.
+                keep = self._downsample_points(xy_e_full, self.max_points)
+
                 code = self._rule_code(layer, obj)
                 speed_limit = self._speed_limit(obj)
                 layer_upper = layer.upper()
+
+                # Synthesize drivable area from polygon-backed map objects.
+                if kind == "polygon" and (
+                        "LANE" in layer_upper
+                        or "ROADBLOCK" in layer_upper
+                        or "CARPARK" in layer_upper
+                        or "DRIVABLE" in layer_upper
+                ):
+                    drivable_polygons.append(xy_e_full)
+
+                # Rule geometry should be denser than max_points=20, because GeometryQuery
+                # uses it for exact intersections / containment.
+                rule_poly = (
+                    self._downsample_points(xy_e_full, 80)
+                    if kind == "polygon"
+                    else np.zeros((0, 2), dtype=np.float32)
+                )
+                rule_line = (
+                    self._downsample_points(xy_e_full, 80)
+                    if kind != "polygon"
+                    else np.zeros((0, 2), dtype=np.float32)
+                )
 
                 if n < self.max_polylines:
                     count = min(len(keep), self.max_points)
@@ -303,10 +429,14 @@ class NuPlanMapProvider(NullMapProvider):
                     n += 1
 
                 if is_route:
-                    if kind == "polygon" and len(keep) >= 3:
-                        route_polygons.append(keep.astype(float).tolist())
+                    if kind == "polygon" and len(xy_e_full) >= 3:
+                        route_polygons.append(
+                            self._downsample_points(xy_e_full, 80).astype(float).tolist()
+                        )
                     else:
-                        route_polyline_centers.append(keep.astype(float).tolist())
+                        route_polyline_centers.append(
+                            self._downsample_points(xy_e_full, 80).astype(float).tolist()
+                        )
 
                 # Traffic-light state is keyed by lane_connector_id in nuPlan. The map
                 # does not expose physical signal geometry, so we attach the state to
@@ -322,8 +452,8 @@ class NuPlanMapProvider(NullMapProvider):
                             "layer": "TRAFFIC_LIGHT_CONNECTOR",
                             "rule_code": int(MapRuleCode.TRAFFIC_LIGHT_RED),
                             "xy": centroid.astype(float).tolist(),
-                            "polyline": keep.astype(float).tolist(),
-                            "polygon": keep.astype(float).tolist() if kind == "polygon" else [],
+                            "polyline": rule_line.astype(float).tolist() if len(rule_line) else keep.astype(float).tolist(),
+                            "polygon": rule_poly.astype(float).tolist(),
                             "geometry_type": kind,
                             "map_object_id": obj_id,
                             "roadblock_id": roadblock_id,
@@ -338,8 +468,8 @@ class NuPlanMapProvider(NullMapProvider):
                         "layer": layer,
                         "rule_code": int(code),
                         "xy": centroid.astype(float).tolist(),
-                        "polyline": keep.astype(float).tolist(),
-                        "polygon": keep.astype(float).tolist() if kind == "polygon" else [],
+                        "polyline": rule_line.astype(float).tolist(),
+                        "polygon": rule_poly.astype(float).tolist(),
                         "geometry_type": kind,
                         "map_object_id": obj_id,
                         "roadblock_id": roadblock_id,
@@ -358,6 +488,10 @@ class NuPlanMapProvider(NullMapProvider):
                         "speed_limit_mps": float(speed_limit),
                         "is_route": bool(is_route),
                     })
+
+            drivable_rule = self._drivable_union_rule(drivable_polygons)
+            if drivable_rule is not None:
+                rule_units.append(drivable_rule)
 
             if route_polygons or route_polyline_centers:
                 # A route-deviation unit gives GeometryQuery a single evidence unit
