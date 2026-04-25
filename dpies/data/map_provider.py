@@ -89,15 +89,33 @@ class NuPlanMapProvider(NullMapProvider):
             self._init_error = str(exc)
             self.available = False
 
+    def _normalized_map_root(self) -> str:
+        if self.map_root is None:
+            raise RuntimeError("map_root is None")
+
+        root = self.map_root
+
+        # official get_maps_api expects the parent directory that contains map_version.
+        # If user passes /.../maps/nuplan-maps-v1.0, use /.../maps.
+        if root.name == self.map_version:
+            root = root.parent
+
+        return str(root)
+
     def _api(self, map_name: str) -> Any:
+        map_name = str(map_name).strip()
         if map_name in self._apis:
             return self._apis[map_name]
         if not self.available or self.map_root is None:
-            raise RuntimeError("nuPlan map API unavailable")
+            raise RuntimeError(f"nuPlan map API unavailable: {getattr(self, '_init_error', '')}")
+
+        map_root = self._normalized_map_root()
+
         try:
-            api = self._get_maps_api(str(self.map_root), self.map_version, map_name)
+            api = self._get_maps_api(map_root, self.map_version, map_name)
         except TypeError:
-            api = self._get_maps_api(str(self.map_root), map_name)
+            api = self._get_maps_api(map_root, map_name)
+
         self._apis[map_name] = api
         return api
 
@@ -211,10 +229,15 @@ class NuPlanMapProvider(NullMapProvider):
             "line_string",
             "left_boundary",
             "right_boundary",
-            "incoming_edges",
-            "outgoing_edges",
         )
-        attr_order = line_attrs if ("STOP" in u or "BOUNDARY" in u) else polygon_attrs + line_attrs
+        if "STOP" in u:
+            # nuPlan stop-line objects can be represented as polygon-like objects.
+            # Try polygon attrs too, then line attrs.
+            attr_order = polygon_attrs + line_attrs
+        elif "BOUNDARY" in u:
+            attr_order = line_attrs + polygon_attrs
+        else:
+            attr_order = polygon_attrs + line_attrs
         for attr in attr_order:
             try:
                 if hasattr(obj, attr):
