@@ -73,9 +73,10 @@ class NuPlanMapProvider(NullMapProvider):
         self._warned: set[str] = set()
         self.available = False
         try:
+            from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
             from nuplan.common.actor_state.state_representation import Point2D
             from nuplan.common.maps.maps_datatypes import SemanticMapLayer
-
+            self._get_maps_api = get_maps_api
             self._Point2D = Point2D
             self._Layer = SemanticMapLayer
             self.available = True
