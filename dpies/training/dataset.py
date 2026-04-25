@@ -48,7 +48,14 @@ class EvidenceCacheDataset(Dataset):
         out: Dict[str, Any] = {}
         for k, v in z.items():
             if k in STRING_KEYS:
-                out[k] = str(v)
+                if isinstance(v, np.ndarray) and v.shape == ():
+                    vv = v.item()
+                else:
+                    vv = v
+                if isinstance(vv, bytes):
+                    out[k] = vv.decode("utf-8")
+                else:
+                    out[k] = str(vv)
             elif k == "ego_history":
                 out[k] = torch.from_numpy(_upgrade_ego_history(np.asarray(v))).float()
             elif k in FLOAT_KEYS:

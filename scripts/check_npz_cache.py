@@ -12,11 +12,22 @@ import numpy as np
 def _as_json(value):
     if isinstance(value, np.ndarray):
         value = value.item() if value.shape == () else value.tolist()
+
     if isinstance(value, bytes):
         value = value.decode("utf-8")
+
     if not isinstance(value, str):
         value = str(value)
-    return json.loads(value)
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse JSON field. len={len(value)}, "
+            f"error={exc}. The field is likely truncated by fixed-length numpy dtype "
+            f"such as <U32768. Regenerate this npz after changing JSON saving to "
+            f"object dtype or UTF-8 bytes."
+        ) from exc
 
 
 def _shape(d, key):

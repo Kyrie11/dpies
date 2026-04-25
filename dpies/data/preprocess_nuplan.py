@@ -204,10 +204,10 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         "signed_evidence_label": signed.astype(np.float32),
         "signed_evidence_mask": active.astype(bool),
         "logged_ego_future": logged_future.astype(np.float32),
-        "metadata_json": np.asarray(json.dumps(sample_meta), dtype="<U4096"),
-        "evidence_metadata_json": np.asarray(json.dumps(evidence_metadata), dtype="<U32768"),
-        "route_info_json": np.asarray(json.dumps(map_obj.route_info), dtype="<U65536"),
-        "traffic_lights_json": np.asarray(json.dumps({"current": traffic_lights_current, "future": traffic_lights_future}), dtype="<U65536"),
+        "metadata_json": json_bytes(sample_meta),
+        "evidence_metadata_json": json_bytes(evidence_metadata),
+        "route_info_json": json_bytes(map_obj.route_info),
+        "traffic_lights_json": json_bytes({"current": traffic_lights_current, "future": traffic_lights_future}),
     }
 
 
@@ -217,6 +217,8 @@ def save_sample(path: Path, sample: Dict[str, np.ndarray], compress: bool = Fals
     else:
         np.savez(path, **sample)
 
+def json_bytes(obj: object) -> np.ndarray:
+    return np.asarray(json.dumps(obj, ensure_ascii=False).encode("utf-8"), dtype=np.bytes_)
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Preprocess nuPlan DB files into DPIES training cache.")
