@@ -1,21 +1,55 @@
 from __future__ import annotations
 
-"""nuPlan closed-loop planner adapter skeleton.
+"""nuPlan closed-loop planner adapter for DPIES.
 
-The offline cache/training path is fully implemented. Closed-loop evaluation in
-nuPlan requires the exact devkit version used in your environment. This adapter
-keeps all DPIES-specific logic in one place and can be connected to the devkit's
-AbstractPlanner by mapping nuPlan PlannerInput -> the same tensors produced by
-preprocess_nuplan.py.
+This module implements the official devkit planner interface while keeping all
+DPIES preprocessing logic schema-consistent with offline cache generation:
+PlannerInitialization/PlannerInput -> ego/agent/map/action/evidence/query tensors
+-> DPIESNetwork -> capped evidence selection -> max-min action -> InterpolatedTrajectory.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
+try:  # Keep the file importable without nuPlan for syntax tests.
+    from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner  # type: ignore
+except Exception:  # pragma: no cover
+    class AbstractPlanner:  # type: ignore
+        pass
+
+from dpies.actions.action_generator import ActionGenerator, ActionGeneratorConfig
+from dpies.common.geometry import ego_to_global_points
+from dpies.data.devkit_utils import traffic_from_planner_input
+from dpies.data.map_provider import NuPlanMapProvider
+from dpies.data.scenario_api import build_history_tensors_from_simulation, ego_state_to_global_array
+from dpies.evidence.evidence_builder import EvidenceBuilder, EvidenceBuilderConfig
+from dpies.evidence.geometry_query import compute_geometry_query
 from dpies.model.network import DPIESConfig, DPIESNetwork
 from dpies.selection.capped_greedy import capped_greedy_select_batch, compute_q_scores, make_directed_pair_mask
+
+
+@dataclass
+class DPIESClosedLoopConfig:
+    history_seconds: float = 2.0
+    future_seconds: float = 8.0
+    dt: float = 0.5
+    max_agents: int = 64
+    agent_radius_m: float = 80.0
+    max_actions: int = 32
+    max_evidence_units: int = 128
+    max_map_polylines: int = 256
+    max_map_points: int = 20
+    map_radius_m: float = 80.0
+    top_m: int = 4
+    budget: float = 32.0
+    eta_e: float = 0.05
+    gamma0: float = 1.0
+    device: str = "cuda"
+    fallback_on_error: bool = True
 
 
 class DPIESPlannerCore:
@@ -23,64 +57,229 @@ class DPIESPlannerCore:
                  budget: float = 32, eta_e: float = 0.05, gamma0: float = 1.0):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         ckpt = torch.load(checkpoint, map_location=self.device)
-        cfg = ckpt.get("config", {}).get("model", {})
+        cfg = ckpt.get("config", {}).get("model", {}) if isinstance(ckpt, dict) else {}
         self.model = DPIESNetwork(DPIESConfig(**cfg)).to(self.device)
-        self.model.load_state_dict(ckpt["model"])
+        state = ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
+        self.model.load_state_dict(state)
         self.model.eval()
-        self.top_m = top_m
-        self.budget = budget
-        self.eta_e = eta_e
-        self.gamma0 = gamma0
+        self.top_m = int(top_m)
+        self.budget = float(budget)
+        self.eta_e = float(eta_e)
+        self.gamma0 = float(gamma0)
 
     @torch.no_grad()
-    def choose_action(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        out = self.model(batch)
-        pair_mask = make_directed_pair_mask(out["rival_scores"], batch["action_mask"], self.top_m)
+    def choose_action(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
+        dev_batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        out = self.model(dev_batch)
+        pair_mask = make_directed_pair_mask(out["rival_scores"], dev_batch["action_mask"], self.top_m)
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
-                                             batch["evidence_mask"], batch["evidence_cost"],
+                                             dev_batch["evidence_mask"], dev_batch["evidence_cost"],
                                              self.budget, self.eta_e, self.gamma0)
-        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"])
-        pred = q.masked_fill(~batch["action_mask"].bool(), -1e9).argmax(dim=-1)
-        return pred, q
+        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, dev_batch["action_mask"])
+        pred = q.masked_fill(~dev_batch["action_mask"].bool(), -1e9).argmax(dim=-1)
+        return pred.detach().cpu(), q.detach().cpu(), selected
+
+
+class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
+    """Official nuPlan closed-loop planner for DPIES.
+
+    Hydra target:
+        dpies.evaluation.closed_loop_planner.DPIESNuPlanPlanner
+    """
+
+    requires_scenario = False
+
+    def __init__(self, checkpoint: str, **kwargs: Any):
+        cfg_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in DPIESClosedLoopConfig.__dataclass_fields__}
+        self.cfg = DPIESClosedLoopConfig(**cfg_kwargs)
+        self.core = DPIESPlannerCore(
+            checkpoint=checkpoint,
+            device=self.cfg.device,
+            top_m=self.cfg.top_m,
+            budget=self.cfg.budget,
+            eta_e=self.cfg.eta_e,
+            gamma0=self.cfg.gamma0,
+        )
+        self.map_provider = NuPlanMapProvider(None, self.cfg.max_map_polylines, self.cfg.max_map_points)
+        self.action_gen = ActionGenerator(ActionGeneratorConfig(
+            max_actions=self.cfg.max_actions,
+            horizon_s=self.cfg.future_seconds,
+            dt=self.cfg.dt,
+        ))
+        self.evidence_builder = EvidenceBuilder(EvidenceBuilderConfig(
+            max_units=self.cfg.max_evidence_units,
+            radius_m=self.cfg.agent_radius_m,
+        ))
+        self.initialization = None
+        self.last_debug: dict[str, Any] = {}
+
+    def name(self) -> str:
+        return "dpies_planner"
+
+    def observation_type(self):
+        from nuplan.planning.simulation.observation.observation_type import DetectionsTracks  # type: ignore
+        return DetectionsTracks
+
+    def initialize(self, initialization: Any) -> None:
+        self.initialization = initialization
+
+    def _planner_input_to_batch(self, current_input: Any) -> dict[str, torch.Tensor]:
+        history = current_input.history
+        ego_states = list(history.ego_states)
+        observations = list(history.observations)
+        current_ego, _ = history.current_state
+        current_global = ego_state_to_global_array(current_ego)
+        ego_xy, ego_yaw = current_global[:2], float(current_global[2])
+        hist_steps = int(round(self.cfg.history_seconds / self.cfg.dt)) + 1
+        ego_history, agent_history, agent_history_mask, agent_mask, agent_track_id, agent_type = build_history_tensors_from_simulation(
+            ego_states=ego_states,
+            observations=observations,
+            max_agents=self.cfg.max_agents,
+            history_steps=hist_steps,
+            ego_xy=ego_xy,
+            ego_yaw=ego_yaw,
+            agent_radius_m=self.cfg.agent_radius_m,
+        )
+        if self.initialization is None:
+            raise RuntimeError("DPIESNuPlanPlanner.initialize() must be called before compute_planner_trajectory")
+        route_ids = [str(x) for x in getattr(self.initialization, "route_roadblock_ids", [])]
+        map_api = getattr(self.initialization, "map_api", None)
+        if map_api is None:
+            raise RuntimeError("PlannerInitialization.map_api is required for DPIES closed-loop inference")
+        traffic_light_records = traffic_from_planner_input(current_input)
+        map_obj = self.map_provider.extract_from_api(
+            map_api,
+            ego_xy,
+            ego_yaw,
+            self.cfg.map_radius_m,
+            route_roadblock_ids=route_ids,
+            traffic_lights=traffic_light_records,
+            future_traffic_lights=None,
+        )
+        actions, action_meta, action_mask = self.action_gen.generate(
+            ego_history,
+            agent_history=agent_history,
+            agent_mask=agent_mask,
+            map_context=map_obj,
+            rule_units=map_obj.rule_units,
+            traffic_lights=traffic_light_records,
+        )
+        evidence_features, evidence_type, evidence_cost, evidence_mask = self.evidence_builder.build(
+            agent_history,
+            agent_mask,
+            actions,
+            action_mask,
+            rule_units=map_obj.rule_units,
+            dt=self.cfg.dt,
+            agent_history_mask=agent_history_mask,
+        )
+        evidence_metadata = list(self.evidence_builder.last_metadata)
+        geometry_query = compute_geometry_query(
+            evidence_features,
+            evidence_type,
+            actions,
+            evidence_mask,
+            action_mask,
+            self.cfg.dt,
+            evidence_metadata=evidence_metadata,
+            route_info=map_obj.route_info,
+        )
+        self.last_debug = {
+            "map_success": bool(map_obj.success),
+            "map_error": str(map_obj.error),
+            "valid_action_count": int(action_mask.sum()),
+            "evidence_count": int(evidence_mask.sum()),
+            "route_roadblocks": len(route_ids),
+            "traffic_lights": len(traffic_light_records),
+            "route_info": map_obj.route_info,
+        }
+
+        def ft(x: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(x).float().unsqueeze(0)
+
+        def bt(x: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(x.astype(bool)).bool().unsqueeze(0)
+
+        def lt(x: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(x).long().unsqueeze(0)
+
+        return {
+            "ego_history": ft(ego_history.astype(np.float32)),
+            "agent_history": ft(agent_history.astype(np.float32)),
+            "agent_history_mask": bt(agent_history_mask),
+            "agent_mask": bt(agent_mask),
+            "map_polylines": ft(map_obj.polylines.astype(np.float32)),
+            "map_masks": bt(map_obj.masks),
+            "actions": ft(actions.astype(np.float32)),
+            "action_meta": ft(action_meta.astype(np.float32)),
+            "action_mask": bt(action_mask),
+            "evidence_features": ft(evidence_features.astype(np.float32)),
+            "evidence_type": lt(evidence_type.astype(np.int64)),
+            "evidence_cost": ft(evidence_cost.astype(np.float32)),
+            "evidence_mask": bt(evidence_mask),
+            "geometry_query": ft(geometry_query.astype(np.float32)),
+        }
+
+    def _trajectory_from_action(self, current_ego: Any, action: np.ndarray) -> Any:
+        from nuplan.common.actor_state.ego_state import EgoState  # type: ignore
+        from nuplan.common.actor_state.state_representation import StateSE2, StateVector2D, TimePoint  # type: ignore
+        from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory  # type: ignore
+
+        current_global = ego_state_to_global_array(current_ego)
+        ego_xy, ego_yaw = current_global[:2], float(current_global[2])
+        vehicle = current_ego.car_footprint.vehicle_parameters
+        base_time_us = int(current_ego.time_us)
+        traj_states = [current_ego]
+        xy_global = ego_to_global_points(action[:, :2], ego_xy, ego_yaw)
+        for i, st in enumerate(action):
+            yaw = float(ego_yaw + st[2])
+            speed = float(max(st[3], 0.0))
+            accel = float(st[4]) if action.shape[-1] > 4 else 0.0
+            vx = speed * np.cos(yaw)
+            vy = speed * np.sin(yaw)
+            ax = accel * np.cos(yaw)
+            ay = accel * np.sin(yaw)
+            time_us = base_time_us + int(round((i + 1) * self.cfg.dt * 1e6))
+            traj_states.append(EgoState.build_from_rear_axle(
+                rear_axle_pose=StateSE2(float(xy_global[i, 0]), float(xy_global[i, 1]), yaw),
+                rear_axle_velocity_2d=StateVector2D(float(vx), float(vy)),
+                rear_axle_acceleration_2d=StateVector2D(float(ax), float(ay)),
+                tire_steering_angle=float(getattr(current_ego, "tire_steering_angle", 0.0)),
+                time_point=TimePoint(time_us),
+                vehicle_parameters=vehicle,
+                is_in_auto_mode=True,
+            ))
+        return InterpolatedTrajectory(traj_states)
+
+    def _fallback_trajectory(self, current_ego: Any) -> Any:
+        from dpies.actions.rollout import stop_rollout
+        current = ego_state_to_global_array(current_ego)
+        speed = float(current[8])
+        action = stop_rollout(speed, max(3.0, speed * 1.5), self.cfg.future_seconds, self.cfg.dt)
+        return self._trajectory_from_action(current_ego, action)
+
+    def compute_planner_trajectory(self, current_input: Any) -> Any:
+        current_ego, _ = current_input.history.current_state
+        try:
+            batch = self._planner_input_to_batch(current_input)
+            pred, q, selected = self.core.choose_action(batch)
+            idx = int(pred[0].item())
+            actions = batch["actions"][0].cpu().numpy()
+            action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
+            if idx < 0 or idx >= actions.shape[0] or not action_mask[idx]:
+                raise RuntimeError(f"invalid DPIES selected action index {idx}")
+            self.last_debug.update({"selected_action": idx, "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0]})
+            return self._trajectory_from_action(current_ego, actions[idx])
+        except Exception as exc:
+            self.last_debug.update({"fallback_reason": str(exc)})
+            if not self.cfg.fallback_on_error:
+                raise
+            return self._fallback_trajectory(current_ego)
 
 
 def build_nuplan_planner_class():
-    """Return a devkit-compatible planner class if nuPlan is installed.
+    """Return the devkit-compatible DPIES planner class.
 
-    Usage pattern:
-        Planner = build_nuplan_planner_class()
-        planner = Planner(checkpoint="runs/dpies_main/best.pt", ...)
-
-    You still need to fill planner_input_to_batch for your nuPlan devkit version.
+    Kept for backward compatibility with earlier skeleton versions.
     """
-    try:
-        from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise ImportError("nuPlan devkit is not installed in this environment") from exc
-
-    class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore
-        def __init__(self, checkpoint: str, **kwargs: Any):
-            self.core = DPIESPlannerCore(checkpoint, **kwargs)
-
-        def name(self) -> str:
-            return "dpies_planner"
-
-        def observation_type(self):
-            try:
-                from nuplan.planning.simulation.observation.observation_type import ObservationType  # type: ignore
-                return ObservationType.DETECTIONS_TRACKS
-            except Exception:
-                return None
-
-        def initialize(self, initialization):
-            self.initialization = initialization
-
-        def compute_planner_trajectory(self, current_input):
-            raise NotImplementedError(
-                "Map nuPlan PlannerInput to the cache-style DPIES batch, call self.core.choose_action, "
-                "then convert the selected nominal action trajectory to InterpolatedTrajectory. "
-                "The offline model/action-selection code is complete; this method is version-specific."
-            )
-
     return DPIESNuPlanPlanner

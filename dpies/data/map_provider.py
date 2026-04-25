@@ -1,13 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
-from dpies.common.geometry import global_to_ego_points, pad_or_trim
-from dpies.common.types import MAP_DIM
+from dpies.common.geometry import global_to_ego_points
+from dpies.common.types import MAP_DIM, MapRuleCode
+from dpies.data.devkit_utils import (
+    DevkitTrafficLightRecord,
+    flatten_traffic_statuses,
+    is_red_status,
+    latest_status_by_connector,
+    records_to_json,
+    red_times_by_connector,
+)
 
 
 @dataclass
@@ -15,6 +25,11 @@ class MapObjects:
     polylines: np.ndarray
     masks: np.ndarray
     rule_units: List[dict]
+    success: bool = False
+    error: str = ""
+    route_info: Dict[str, Any] = field(default_factory=dict)
+    traffic_lights: List[dict] = field(default_factory=list)
+    future_traffic_lights: List[dict] = field(default_factory=list)
 
 
 class NullMapProvider:
@@ -22,125 +37,367 @@ class NullMapProvider:
         self.max_polylines = max_polylines
         self.max_points = max_points
 
-    def extract(self, map_name: str, ego_xy: np.ndarray, ego_yaw: float, radius_m: float) -> MapObjects:
+    def extract(self, map_name: str, ego_xy: np.ndarray, ego_yaw: float, radius_m: float, **_: Any) -> MapObjects:
         return MapObjects(
             polylines=np.zeros((self.max_polylines, self.max_points, MAP_DIM), dtype=np.float32),
             masks=np.zeros((self.max_polylines, self.max_points), dtype=bool),
             rule_units=[],
+            success=False,
+            error="nuPlan map API unavailable",
+            route_info={},
         )
+
+    def extract_from_api(self, map_api: Any, ego_xy: np.ndarray, ego_yaw: float, radius_m: float, **kwargs: Any) -> MapObjects:
+        return self.extract("__api_unavailable__", ego_xy, ego_yaw, radius_m, **kwargs)
 
 
 class NuPlanMapProvider(NullMapProvider):
-    """Defensive optional wrapper around nuPlan's map API.
+    """nuPlan HD map extraction for DPIES.
 
-    If nuPlan devkit is not installed or map extraction fails, this class
-    returns empty map tensors. The rest of the pipeline still works with dynamic
-    evidence, which is useful for smoke tests and direct DB preprocessing.
+    The class supports two entry points:
+      * extract(map_name, ...): loads map_api from map_root/map_name;
+      * extract_from_api(map_api, ...): uses the official devkit Scenario/Planner
+        API map object directly, which is preferred for route/closed-loop use.
+
+    Returned rule_units retain ego-frame geometry in JSON-serializable form so
+    GeometryQuery can compute exact drivable-area, lane-boundary, stop-line,
+    crosswalk, traffic-light, and route-deviation features offline and online.
     """
 
-    def __init__(self, map_root: str | Path | None, max_polylines: int = 256, max_points: int = 20):
+    def __init__(self, map_root: str | Path | None, max_polylines: int = 256, max_points: int = 20,
+                 map_version: str = "nuplan-maps-v1.0"):
         super().__init__(max_polylines=max_polylines, max_points=max_points)
         self.map_root = Path(map_root) if map_root else None
+        self.map_version = map_version
         self._apis: Dict[str, Any] = {}
+        self._warned: set[str] = set()
         self.available = False
         try:
             from nuplan.common.maps.nuplan_map.map_factory import get_maps_api  # type: ignore
-            from nuplan.common.maps.maps_datatypes import Point2D, SemanticMapLayer  # type: ignore
+            from nuplan.common.actor_state.state_representation import Point2D  # type: ignore
+            from nuplan.common.maps.maps_datatypes import SemanticMapLayer  # type: ignore
             self._get_maps_api = get_maps_api
             self._Point2D = Point2D
             self._Layer = SemanticMapLayer
             self.available = True
-        except Exception:
+        except Exception as exc:
             self.available = False
+            self._init_error = str(exc)
 
     def _api(self, map_name: str) -> Any:
         if map_name in self._apis:
             return self._apis[map_name]
         if not self.available or self.map_root is None:
             raise RuntimeError("nuPlan map API unavailable")
-        # Common nuPlan map root contains a version directory. Most installs use nuplan-maps-v1.0.
-        map_version = "nuplan-maps-v1.0"
         try:
-            api = self._get_maps_api(str(self.map_root), map_version, map_name)
+            api = self._get_maps_api(str(self.map_root), self.map_version, map_name)
         except TypeError:
             api = self._get_maps_api(str(self.map_root), map_name)
         self._apis[map_name] = api
         return api
 
     @staticmethod
-    def _coords_from_obj(obj: Any) -> Optional[np.ndarray]:
-        candidates = []
-        for attr in ("baseline_path", "centerline", "linestring", "polygon"):
-            if hasattr(obj, attr):
-                try:
-                    candidates.append(getattr(obj, attr))
-                except Exception:
-                    pass
-        candidates.append(obj)
-        for cand in candidates:
+    def _obj_id(obj: Any) -> str:
+        for attr in ("id", "token", "fid", "lane_id", "roadblock_id"):
             try:
-                if hasattr(cand, "discrete_path"):
-                    pts = cand.discrete_path
-                    xy = np.asarray([[float(p.x), float(p.y)] for p in pts], dtype=np.float32)
-                    if len(xy) >= 2:
-                        return xy
-                if hasattr(cand, "coords"):
-                    xy = np.asarray(cand.coords, dtype=np.float32)[:, :2]
-                    if len(xy) >= 2:
-                        return xy
-                if hasattr(cand, "exterior") and hasattr(cand.exterior, "coords"):
-                    xy = np.asarray(cand.exterior.coords, dtype=np.float32)[:, :2]
-                    if len(xy) >= 2:
-                        return xy
+                if hasattr(obj, attr):
+                    return str(getattr(obj, attr))
             except Exception:
-                continue
+                pass
+        return hashlib.sha1(repr(obj).encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    @staticmethod
+    def _roadblock_id(obj: Any) -> str | None:
+        for attr in ("get_roadblock_id", "roadblock_id", "roadblock_token"):
+            try:
+                val = getattr(obj, attr)
+                val = val() if callable(val) else val
+                if val is not None:
+                    return str(val)
+            except Exception:
+                pass
         return None
 
-    def extract(self, map_name: str, ego_xy: np.ndarray, ego_yaw: float, radius_m: float) -> MapObjects:
+    @staticmethod
+    def _speed_limit(obj: Any) -> float | None:
+        for attr in ("speed_limit_mps", "speed_limit", "speed_limit_mps_or_none"):
+            try:
+                val = getattr(obj, attr)
+                val = val() if callable(val) else val
+                if val is not None:
+                    return float(val)
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _coords_from_candidate(cand: Any) -> Optional[np.ndarray]:
+        try:
+            if hasattr(cand, "discrete_path"):
+                pts = cand.discrete_path
+                xy = np.asarray([[float(p.x), float(p.y)] for p in pts], dtype=np.float32)
+                return xy if len(xy) >= 2 else None
+            if hasattr(cand, "coords"):
+                xy = np.asarray(cand.coords, dtype=np.float32)[:, :2]
+                return xy if len(xy) >= 2 else None
+            if hasattr(cand, "exterior") and hasattr(cand.exterior, "coords"):
+                xy = np.asarray(cand.exterior.coords, dtype=np.float32)[:, :2]
+                return xy if len(xy) >= 3 else None
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _geometry_from_obj(cls, obj: Any, layer: str) -> tuple[str, Optional[np.ndarray]]:
+        """Return ('polygon'|'polyline', global xy coords) when possible."""
+        u = layer.upper()
+        # Prefer true polygons for area-like objects; prefer lines for stop/boundary.
+        polygon_attrs = ("polygon", "exterior_polygon")
+        line_attrs = ("baseline_path", "centerline", "linestring")
+        attr_order = line_attrs if ("STOP" in u or "BOUNDARY" in u) else polygon_attrs + line_attrs
+        for attr in attr_order:
+            try:
+                if hasattr(obj, attr):
+                    cand = getattr(obj, attr)
+                    xy = cls._coords_from_candidate(cand)
+                    if xy is not None:
+                        kind = "polygon" if attr in polygon_attrs or (len(xy) >= 4 and np.allclose(xy[0], xy[-1])) else "polyline"
+                        return kind, xy.astype(np.float32)
+            except Exception:
+                continue
+        xy = cls._coords_from_candidate(obj)
+        if xy is not None:
+            kind = "polygon" if (len(xy) >= 4 and np.allclose(xy[0], xy[-1])) else "polyline"
+            return kind, xy.astype(np.float32)
+        return "point", None
+
+    @staticmethod
+    def _rule_code(layer: str, obj: Any | None = None) -> int:
+        u = layer.upper()
+        if "TRAFFIC" in u:
+            return int(MapRuleCode.TRAFFIC_LIGHT_RED)
+        if "STOP" in u:
+            return int(MapRuleCode.STOP_LINE)
+        if "CROSS" in u or "WALK" in u:
+            return int(MapRuleCode.CROSSWALK)
+        if "BOUNDARY" in u:
+            return int(MapRuleCode.LANE_BOUNDARY)
+        if "DRIVABLE" in u or "CARPARK" in u:
+            return int(MapRuleCode.DRIVABLE_AREA)
+        if "CONNECTOR" in u:
+            return int(MapRuleCode.LANE_CONNECTOR)
+        if "INTERSECTION" in u:
+            return int(MapRuleCode.INTERSECTION)
+        return int(MapRuleCode.NONE)
+
+    def _layer_list(self) -> list[Any]:
+        names = [
+            "LANE", "LANE_CONNECTOR", "ROADBLOCK", "ROADBLOCK_CONNECTOR",
+            "CROSSWALK", "STOP_LINE", "WALKWAYS", "CARPARK_AREA",
+            "DRIVABLE_AREA", "LANE_BOUNDARY", "TRAFFIC_LIGHT_CONNECTOR",
+            "INTERSECTION",
+        ]
+        layers = []
+        for name in names:
+            if hasattr(self._Layer, name):
+                layers.append(getattr(self._Layer, name))
+        return layers
+
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key not in self._warned:
+            warnings.warn(msg, RuntimeWarning)
+            self._warned.add(key)
+
+    def extract(self, map_name: str, ego_xy: np.ndarray, ego_yaw: float, radius_m: float,
+                route_roadblock_ids: Sequence[str] | None = None,
+                traffic_lights: Sequence[Any] | None = None,
+                future_traffic_lights: Sequence[Any] | None = None) -> MapObjects:
         if not self.available:
-            return super().extract(map_name, ego_xy, ego_yaw, radius_m)
+            err = getattr(self, "_init_error", "nuPlan map API unavailable")
+            self._warn_once("unavailable", f"nuPlan map API unavailable; map tensors will be empty ({err})")
+            obj = super().extract(map_name, ego_xy, ego_yaw, radius_m)
+            obj.error = err
+            return obj
         try:
             api = self._api(map_name)
-            layer_names = [
-                "LANE", "LANE_CONNECTOR", "ROADBLOCK", "ROADBLOCK_CONNECTOR",
-                "CROSSWALK", "STOP_LINE", "WALKWAYS", "CARPARK_AREA",
-            ]
-            layers = []
-            for name in layer_names:
-                if hasattr(self._Layer, name):
-                    layers.append(getattr(self._Layer, name))
-            objects = api.get_proximal_map_objects(self._Point2D(float(ego_xy[0]), float(ego_xy[1])), radius_m, layers)
-        except Exception:
-            return super().extract(map_name, ego_xy, ego_yaw, radius_m)
+        except Exception as exc:
+            err = str(exc)
+            self._warn_once(f"api:{map_name}", f"Map API creation failed for {map_name}: {err}")
+            obj = super().extract(map_name, ego_xy, ego_yaw, radius_m)
+            obj.error = err
+            return obj
+        return self.extract_from_api(
+            api, ego_xy, ego_yaw, radius_m,
+            route_roadblock_ids=route_roadblock_ids,
+            traffic_lights=traffic_lights,
+            future_traffic_lights=future_traffic_lights,
+        )
+
+    def extract_from_api(self, map_api: Any, ego_xy: np.ndarray, ego_yaw: float, radius_m: float,
+                         route_roadblock_ids: Sequence[str] | None = None,
+                         traffic_lights: Sequence[Any] | None = None,
+                         future_traffic_lights: Sequence[Any] | None = None) -> MapObjects:
+        if not self.available:
+            # Closed-loop can pass an already-created map_api even when map_root is not set.
+            try:
+                from nuplan.common.maps.maps_datatypes import Point2D, SemanticMapLayer  # type: ignore
+                self._Point2D = Point2D
+                self._Layer = SemanticMapLayer
+                self.available = True
+            except Exception as exc:
+                obj = super().extract("__api_unavailable__", ego_xy, ego_yaw, radius_m)
+                obj.error = str(exc)
+                return obj
+        try:
+            objects = map_api.get_proximal_map_objects(self._Point2D(float(ego_xy[0]), float(ego_xy[1])), radius_m, self._layer_list())
+        except Exception as exc:
+            err = str(exc)
+            self._warn_once("extract_from_api", f"Map extraction from supplied API failed: {err}")
+            obj = super().extract("__api_failed__", ego_xy, ego_yaw, radius_m)
+            obj.error = err
+            return obj
+
+        current_tl = flatten_traffic_statuses(traffic_lights, relative_time_s=0.0)
+        future_tl = flatten_traffic_statuses(future_traffic_lights, relative_time_s=None)
+        status_by_connector = latest_status_by_connector(current_tl)
+        red_times = red_times_by_connector(current_tl + future_tl)
+        route_ids = {str(x) for x in (route_roadblock_ids or [])}
 
         polylines = np.zeros((self.max_polylines, self.max_points, MAP_DIM), dtype=np.float32)
         masks = np.zeros((self.max_polylines, self.max_points), dtype=bool)
         rule_units: List[dict] = []
+        route_polygons: list[list[list[float]]] = []
+        route_polyline_centers: list[list[list[float]]] = []
         n = 0
+
         try:
-            iterable = []
+            iterable: list[tuple[str, Any]] = []
             if isinstance(objects, dict):
                 for layer, vals in objects.items():
+                    lname = getattr(layer, "name", str(layer))
                     for obj in vals:
-                        iterable.append((str(layer), obj))
+                        iterable.append((str(lname), obj))
             else:
                 iterable = [("unknown", obj) for obj in objects]
+
             for layer, obj in iterable:
-                xy = self._coords_from_obj(obj)
-                if xy is None or len(xy) < 2:
+                obj_id = self._obj_id(obj)
+                roadblock_id = self._roadblock_id(obj)
+                is_route = bool(route_ids and (obj_id in route_ids or (roadblock_id is not None and roadblock_id in route_ids)))
+                kind, xy_global = self._geometry_from_obj(obj, layer)
+                if xy_global is None or len(xy_global) < 2:
                     continue
-                xy_e = global_to_ego_points(xy, ego_xy, ego_yaw)
-                keep = xy_e[np.linspace(0, len(xy_e) - 1, min(len(xy_e), self.max_points)).astype(int)]
+                xy_e = global_to_ego_points(xy_global, ego_xy, ego_yaw)
+                keep_idx = np.linspace(0, len(xy_e) - 1, min(len(xy_e), self.max_points)).astype(int)
+                keep = xy_e[keep_idx]
+                code = self._rule_code(layer, obj)
+                speed_limit = self._speed_limit(obj)
+                layer_upper = layer.upper()
+
                 if n < self.max_polylines:
                     count = min(len(keep), self.max_points)
                     polylines[n, :count, 0:2] = keep[:count]
-                    polylines[n, :count, 2] = 1.0 if "LANE" in layer else 0.0
-                    polylines[n, :count, 3] = 1.0 if any(k in layer for k in ("STOP", "CROSS", "WALK")) else 0.0
+                    polylines[n, :count, 2] = 1.0 if "LANE" in layer_upper else 0.0
+                    polylines[n, :count, 3] = 1.0 if (code != int(MapRuleCode.NONE) or is_route) else 0.0
                     masks[n, :count] = True
                     n += 1
-                if any(k in layer for k in ("STOP", "CROSS", "TRAFFIC", "WALK")):
-                    centroid = xy_e.mean(axis=0)
-                    rule_units.append({"layer": layer, "xy": centroid.astype(np.float32), "polyline": xy_e.astype(np.float32)})
-        except Exception:
-            pass
-        return MapObjects(polylines=polylines, masks=masks, rule_units=rule_units)
+
+                if is_route:
+                    if kind == "polygon" and len(keep) >= 3:
+                        route_polygons.append(keep.astype(float).tolist())
+                    else:
+                        route_polyline_centers.append(keep.astype(float).tolist())
+
+                # Traffic-light state is keyed by lane_connector_id in nuPlan. The map
+                # does not expose physical signal geometry, so we attach the state to
+                # the corresponding lane-connector geometry when available.
+                lc_id = obj_id
+                has_red = lc_id in red_times and len(red_times[lc_id]) > 0
+                has_tl_state = lc_id in status_by_connector or has_red
+                if has_tl_state and "LANE_CONNECTOR" in layer_upper:
+                    status = status_by_connector.get(lc_id, "FUTURE_RED")
+                    if has_red or is_red_status(status):
+                        centroid = keep.mean(axis=0)
+                        rule_units.append({
+                            "layer": "TRAFFIC_LIGHT_CONNECTOR",
+                            "rule_code": int(MapRuleCode.TRAFFIC_LIGHT_RED),
+                            "xy": centroid.astype(float).tolist(),
+                            "polyline": keep.astype(float).tolist(),
+                            "polygon": keep.astype(float).tolist() if kind == "polygon" else [],
+                            "geometry_type": kind,
+                            "map_object_id": obj_id,
+                            "roadblock_id": roadblock_id,
+                            "lane_connector_id": lc_id,
+                            "traffic_light_status": status,
+                            "red_times_s": [float(x) for x in red_times.get(lc_id, [0.0])],
+                        })
+
+                if code != int(MapRuleCode.NONE):
+                    centroid = keep.mean(axis=0)
+                    rule_units.append({
+                        "layer": layer,
+                        "rule_code": int(code),
+                        "xy": centroid.astype(float).tolist(),
+                        "polyline": keep.astype(float).tolist(),
+                        "polygon": keep.astype(float).tolist() if kind == "polygon" else [],
+                        "geometry_type": kind,
+                        "map_object_id": obj_id,
+                        "roadblock_id": roadblock_id,
+                        "is_route": bool(is_route),
+                    })
+                if speed_limit is not None and ("LANE" in layer_upper or "CONNECTOR" in layer_upper):
+                    centroid = keep.mean(axis=0)
+                    rule_units.append({
+                        "layer": "SPEED_LIMIT",
+                        "rule_code": int(MapRuleCode.SPEED_LIMIT),
+                        "xy": centroid.astype(float).tolist(),
+                        "polyline": keep.astype(float).tolist(),
+                        "polygon": keep.astype(float).tolist() if kind == "polygon" else [],
+                        "geometry_type": kind,
+                        "map_object_id": obj_id,
+                        "speed_limit_mps": float(speed_limit),
+                        "is_route": bool(is_route),
+                    })
+
+            if route_polygons or route_polyline_centers:
+                # A route-deviation unit gives GeometryQuery a single evidence unit
+                # whose geometry is the on-route local corridor around ego.
+                pts = np.asarray([p for poly in (route_polygons or route_polyline_centers) for p in poly], dtype=np.float32)
+                xy = pts.mean(axis=0) if len(pts) else np.asarray([0.0, 0.0], dtype=np.float32)
+                rule_units.append({
+                    "layer": "ROUTE_CORRIDOR",
+                    "rule_code": int(MapRuleCode.ROUTE_DEVIATION),
+                    "xy": xy.astype(float).tolist(),
+                    "polyline": [],
+                    "polygon": [],
+                    "polygons": route_polygons,
+                    "polylines": route_polyline_centers,
+                    "geometry_type": "multi_polygon" if route_polygons else "multi_polyline",
+                    "map_object_id": "route_corridor",
+                })
+        except Exception as exc:
+            return MapObjects(
+                polylines=polylines, masks=masks, rule_units=rule_units,
+                success=False, error=str(exc), route_info={},
+                traffic_lights=records_to_json(current_tl), future_traffic_lights=records_to_json(future_tl),
+            )
+
+        route_info: dict[str, Any] = {
+            "route_roadblock_ids": [str(x) for x in route_ids],
+            "num_route_polygons_local": len(route_polygons),
+            "num_route_polylines_local": len(route_polyline_centers),
+            "route_polygons": route_polygons[:64],
+            "route_polylines": route_polyline_centers[:64],
+            "traffic_lights_current": records_to_json(current_tl),
+            "traffic_lights_future": records_to_json(future_tl),
+        }
+        return MapObjects(
+            polylines=polylines,
+            masks=masks,
+            rule_units=rule_units,
+            success=bool(n > 0),
+            error="" if n > 0 else "no proximal map objects returned",
+            route_info=route_info,
+            traffic_lights=records_to_json(current_tl),
+            future_traffic_lights=records_to_json(future_tl),
+        )

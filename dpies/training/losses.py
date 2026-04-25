@@ -19,11 +19,14 @@ def screening_loss(rival_logits: torch.Tensor, rival_label: torch.Tensor, action
 
 
 def evidence_loss(pred_signed: torch.Tensor, target_signed: torch.Tensor, active_mask: torch.Tensor,
-                  evidence_mask: torch.Tensor, action_mask: torch.Tensor, huber_delta: float = 1.0) -> torch.Tensor:
+                  evidence_mask: torch.Tensor, action_mask: torch.Tensor, pair_mask: torch.Tensor | None = None,
+                  huber_delta: float = 1.0, loss_on_all_pairs: bool = False) -> torch.Tensor:
     b, n, k, _ = pred_signed.shape
     eye = torch.eye(k, dtype=torch.bool, device=pred_signed.device)[None, None]
     valid = evidence_mask[:, :, None, None] & action_mask[:, None, :, None] & action_mask[:, None, None, :] & (~eye)
     valid = valid & active_mask.bool()
+    if pair_mask is not None and not loss_on_all_pairs:
+        valid = valid & pair_mask[:, None, :, :].bool()
     if valid.sum() == 0:
         return pred_signed.sum() * 0.0
     loss = F.huber_loss(pred_signed, target_signed, delta=huber_delta, reduction="none")
@@ -58,7 +61,8 @@ def compute_total_loss(outputs: dict, batch: dict, pair_mask: torch.Tensor, q_sc
                        weights: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     l_scr = screening_loss(outputs["rival_logits"], batch["rival_label"], batch["action_mask"], weights.get("positive_weight_alpha", 5.0))
     l_evi = evidence_loss(outputs["signed_evidence"], batch["signed_evidence_label"], batch["signed_evidence_mask"],
-                          batch["evidence_mask"], batch["action_mask"], weights.get("huber_delta", 1.0))
+                          batch["evidence_mask"], batch["action_mask"], pair_mask,
+                          weights.get("huber_delta", 1.0), bool(weights.get("loss_on_all_pairs", False)))
     l_act = action_identity_loss(q_scores, batch["oracle_action_index"], batch["action_mask"], weights.get("tau_q", 1.0))
     l_hn = hard_negative_loss(q_scores, batch["oracle_action_index"], batch["action_mask"], weights.get("action_margin", 0.5))
     total = (weights.get("lambda_scr", 1.0) * l_scr + weights.get("lambda_evi", 1.0) * l_evi +

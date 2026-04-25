@@ -1,51 +1,40 @@
 # DPIES-nuPlan: Decision-Preserving Interaction Evidence Selection
 
-This repository implements the paper method described in the uploaded Method/Appendix and `implementation_notes.md` for nuPlan DB data and PyTorch.
+This repository is an implementation-oriented nuPlan codebase for Decision-Preserving Interaction Evidence Selection (DPIES). It follows `implementation_notes.md` as the implementation specification:
 
-The implementation follows the four-stage design:
-
-1. finite candidate ego action set;
+1. finite ego candidate action set;
 2. high-recall interaction evidence construction;
 3. rival-pair screening and pair-conditioned signed evidence prediction;
-4. capped global evidence selection under a budget and max-min pairwise action selection.
+4. capped global evidence selection under a budget;
+5. max-min pairwise action selection.
 
-The code is intentionally modular so you can replace the heuristic candidate/evidence/teacher pieces with stronger nuPlan-devkit integrations later without changing the model/loss/selection path.
+## Important implementation status
 
----
+This version fixes several correctness issues in the original skeleton, improves preprocessing speed, and adds an official nuPlan-devkit v1.1 integration path for route roadblocks, traffic-light status/future labels, exact HD-map rule geometry, and closed-loop simulation. Direct SQLite extraction still reads ego/agents efficiently, while route and traffic-light labels use the official devkit query functions when installed. HD-map extraction can also consume the official Scenario/Planner `map_api` directly for closed-loop inference.
 
-## 1. Repository layout
+### Main changes in this optimized version
 
-```text
-configs/
-  data.yaml              # default nuPlan paths and preprocessing settings
-  model.yaml             # model dimensions
-  train.yaml             # training config
-  eval.yaml              # offline evaluation config
-dpies/
-  actions/               # candidate generation, rollout, filtering, coverage metrics
-  common/                # geometry, config, io, torch helpers
-  data/                  # direct SQLite nuPlan reader, map wrapper, preprocessing
-  evidence/              # evidence builder, geometry query, evidence cost
-  teacher/               # teacher evaluator, local costs, oracle/rival/evidence labels
-  model/                 # scene/action/evidence/pair encoders and network
-  selection/             # capped greedy evidence selection and Q scores
-  training/              # dataset, collate, losses, train/validate
-  evaluation/            # offline metrics, budget curves, closed-loop adapter skeleton
-  tools/                 # toy cache and visualization tools
-scripts/
-  inspect_db.sh
-  build_cache_train.sh
-  build_cache_val.sh
-  train.sh
-  eval_offline.sh
-  smoke_test.sh
-```
+- Ego schema is now explicit: `[x, y, yaw, vx, vy, ax, ay, yaw_rate, speed]`.
+- Legacy 8-D ego caches are upgraded by the dataset loader, but rebuilding caches is recommended.
+- Acceleration is rotated into the ego frame during preprocessing.
+- Action generation uses speed from column 8 or recomputes speed from `vx/vy`; it no longer treats yaw rate as speed.
+- `dt` is propagated to conflict evidence and teacher jerk cost; hardcoded `0.5` was removed.
+- Agent history/future masks are cached to avoid treating missing future boxes as agents at `(0, 0)`.
+- Map extraction failure is exposed through `map_success` and `map_error`; use `--require-map` to skip map-missing samples.
+- Direct SQLite reader caches lidar rows, ego poses and lidar boxes, replacing repeated `ORDER BY ABS(timestamp - ?)` queries with in-memory nearest-time lookup.
+- Evidence units now keep structured JSON metadata (`evidence_metadata_json`) in addition to fixed tensors.
+- Evaluation reports additional diagnostics: top-k action match, normalized regret, Q margin, pairwise ranking accuracy, screening precision, decisive-rival miss rate and evidence prediction metrics.
+- New `--use-scenario-api` preprocessing mode extracts route roadblocks and current/future traffic lights through the official nuPlan Scenario API.
+- HD-map extraction now creates structured route-corridor, traffic-light connector, drivable-area-union and lane-boundary-union rule units.
+- GeometryQuery now uses polygon/line checks for drivable containment, lane-boundary crossing, stop-line/crosswalk intersection and route deviation when structured map geometry is available.
+- A nuPlan `AbstractPlanner` adapter is provided for closed-loop non-reactive and reactive-IDM simulation.
+- nuPlan v1.1 devkit integration now extracts route roadblock ids and current/future traffic-light states through official devkit queries.
+- HD-map extraction now preserves exact rule geometry for drivable-area polygons, lane boundaries, stop lines, crosswalks, speed-limit rules and red traffic-light connectors.
+- `DPIESNuPlanPlanner` implements the official `AbstractPlanner` interface for closed-loop non-reactive/reactive-IDM simulation.
 
 ---
 
-## 2. Environment
-
-Create an environment and install dependencies:
+## 1. Environment
 
 ```bash
 cd dpies_nuplan
@@ -56,19 +45,33 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-Optional but recommended for richer HD-map features and closed-loop integration:
+Required for HD-map extraction and closed-loop integration:
 
 ```bash
-# Install the nuPlan devkit version used by your cluster/project.
-# The direct SQLite preprocessing path below works without it, but map extraction
-# and closed-loop planner wiring are better with the devkit installed.
+# Install your official nuPlan devkit v1.1 checkout/environment.
+# Example when you maintain a local devkit clone:
+#   export NUPLAN_DEVKIT_ROOT=/path/to/nuplan-devkit
+#   pip install -e "$NUPLAN_DEVKIT_ROOT"
+#
+# Preprocessing can still run without the devkit, but route roadblocks,
+# traffic-light labels, exact map-rule geometry and closed-loop simulation
+# require the devkit and map files.
 ```
 
-The provided default paths match your data layout:
+Optional preprocessing stability/performance settings:
+
+```bash
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+```
+
+Default path environment variables for this repository's preprocessing scripts:
 
 ```bash
 export DATA_ROOT=/data0/senzeyu2/dataset/nuplan/data/cache
 export MAP_ROOT=/data0/senzeyu2/dataset/nuplan/maps
+export SENSOR_ROOT=/data0/senzeyu2/dataset/nuplan/sensor_blobs  # optional
 ```
 
 Expected DB split layout:
@@ -84,15 +87,13 @@ $DATA_ROOT/
 
 ---
 
-## 3. Sanity check without nuPlan data
-
-Run this first to verify the package, model, losses, capped selection, and evaluation loop:
+## 2. Sanity check without nuPlan data
 
 ```bash
 bash scripts/smoke_test.sh
 ```
 
-Equivalent expanded commands:
+Expanded commands:
 
 ```bash
 python -m dpies.tools.make_toy_cache --output-dir /tmp/dpies_smoke/train --num-samples 16
@@ -113,9 +114,7 @@ python -m dpies.evaluation.evaluate \
 
 ---
 
-## 4. Inspect nuPlan DB schema
-
-Because nuPlan DB releases can differ slightly in column names, first inspect one DB:
+## 3. Inspect nuPlan DB schema
 
 ```bash
 python -m dpies.data.schema_probe \
@@ -129,13 +128,11 @@ or:
 DATA_ROOT=/data0/senzeyu2/dataset/nuplan/data/cache bash scripts/inspect_db.sh
 ```
 
-The direct SQLite reader expects the usual nuPlan tables such as `lidar_pc`, `ego_pose`, and `lidar_box`. It uses schema introspection for common token/timestamp/box column variants.
-
 ---
 
-## 5. Preprocess validation cache
+## 4. Preprocess validation cache
 
-Build validation cache from `/val`:
+Recommended validation cache command:
 
 ```bash
 python -m dpies.data.preprocess_nuplan \
@@ -153,31 +150,67 @@ python -m dpies.data.preprocess_nuplan \
   --continue-on-error
 ```
 
-or:
+Script form:
 
 ```bash
 bash scripts/build_cache_val.sh
 ```
 
-For a very small debug run:
+Strict HD-map mode:
 
 ```bash
 python -m dpies.data.preprocess_nuplan \
-  --data-root /data0/senzeyu2/dataset/nuplan/data/cache \
-  --map-root /data0/senzeyu2/dataset/nuplan/maps \
-  --output-dir ./cache/val_debug \
+  --data-root "$DATA_ROOT" \
+  --map-root "$MAP_ROOT" \
+  --output-dir ./cache/val_map_required \
   --subdirs val \
-  --max-dbs 1 \
-  --max-samples-per-db 100 \
-  --sample-interval-s 1.0 \
+  --require-map \
   --continue-on-error
+```
+
+Recommended v1.1 official-devkit Scenario API mode:
+
+```bash
+python -m dpies.data.preprocess_nuplan \
+  --data-root "$DATA_ROOT" \
+  --map-root "$MAP_ROOT" \
+  --sensor-root "${SENSOR_ROOT:-}" \
+  --output-dir ./cache/val_scenario_api \
+  --subdirs val \
+  --use-scenario-api \
+  --require-map \
+  --sample-interval-s 1.0 \
+  --history-seconds 2.0 \
+  --future-seconds 8.0 \
+  --dt 0.5 \
+  --continue-on-error
+```
+
+`--use-scenario-api` uses `NuPlanScenario.get_route_roadblock_ids()`, `get_traffic_light_status_at_iteration()`, `get_future_traffic_light_status_history()` and `scenario.map_api`.  This is the recommended cache-building path for full v1.1 DB experiments.
+
+If your DB copy is writable, optional SQLite indexes can help first-run preprocessing:
+
+```bash
+python -m dpies.data.preprocess_nuplan \
+  --data-root "$DATA_ROOT" \
+  --map-root "$MAP_ROOT" \
+  --output-dir ./cache/val \
+  --subdirs val \
+  --create-sqlite-indexes \
+  --continue-on-error
+```
+
+Script toggles:
+
+```bash
+REQUIRE_MAP=1 bash scripts/build_cache_val.sh
+CREATE_SQLITE_INDEXES=1 bash scripts/build_cache_val.sh
+SAMPLE_INTERVAL_S=2.0 bash scripts/build_cache_val.sh
 ```
 
 ---
 
-## 6. Preprocess training cache
-
-Build training cache from all train DB folders:
+## 5. Preprocess training cache
 
 ```bash
 python -m dpies.data.preprocess_nuplan \
@@ -195,18 +228,20 @@ python -m dpies.data.preprocess_nuplan \
   --continue-on-error
 ```
 
-or:
+Script form:
 
 ```bash
 bash scripts/build_cache_train.sh
 ```
 
-For faster experiments, increase `--sample-interval-s` to `2.0` or limit DBs:
+Faster experimental preprocessing options:
 
 ```bash
+SAMPLE_INTERVAL_S=2.0 bash scripts/build_cache_train.sh
+
 python -m dpies.data.preprocess_nuplan \
-  --data-root /data0/senzeyu2/dataset/nuplan/data/cache \
-  --map-root /data0/senzeyu2/dataset/nuplan/maps \
+  --data-root "$DATA_ROOT" \
+  --map-root "$MAP_ROOT" \
   --output-dir ./cache/train_small \
   --subdirs train_boston train_singapore train_pittsburgh train_vegas_2 \
   --max-dbs 20 \
@@ -215,22 +250,32 @@ python -m dpies.data.preprocess_nuplan \
   --continue-on-error
 ```
 
-Each cached `.npz` sample contains:
+### Cache fields
+
+Each `.npz` sample contains the original training tensors plus new schema/debug fields:
 
 ```text
-ego_history, agent_history, map_polylines,
-actions, action_meta, action_mask,
-evidence_features, evidence_type, evidence_cost, evidence_mask,
-geometry_query,
-teacher_cost, oracle_action_index,
-rival_label,
-signed_evidence_label, signed_evidence_mask,
+ego_history                         # [H,9], x,y,yaw,vx,vy,ax,ay,yaw_rate,speed
+agent_history, agent_history_mask
+agent_future, agent_future_mask     # labels/debug only; not a model input
+agent_mask, agent_track_id, agent_type
+map_polylines, map_masks
+actions, action_meta, action_mask
+evidence_features, evidence_type, evidence_cost, evidence_mask
+geometry_query
+teacher_cost, teacher_components, local_cost_sum
+oracle_action_index, rival_label
+signed_evidence_label, signed_evidence_mask
 logged_ego_future
+ego_to_global                       # x,y,yaw at planning time
+metadata_json, evidence_metadata_json, route_info_json, traffic_lights_json
 ```
+
+Rebuild old caches after this update if possible. The dataset loader can upgrade legacy 8-D `ego_history` to 9-D, but old caches do not contain future masks, agent ids or structured evidence metadata.
 
 ---
 
-## 7. Visualize one cached sample
+## 6. Visualize one cached sample
 
 ```bash
 python -m dpies.tools.visualize_sample \
@@ -238,13 +283,9 @@ python -m dpies.tools.visualize_sample \
   --output ./sample_debug.png
 ```
 
-Use this to check that candidate actions and evidence points are reasonable in ego-centric coordinates.
-
 ---
 
-## 8. Train
-
-Default training:
+## 7. Train
 
 ```bash
 python -m dpies.training.train \
@@ -260,48 +301,9 @@ or:
 bash scripts/train.sh
 ```
 
-Useful overrides:
-
-```bash
-# Smaller model / lower memory
-python -m dpies.training.train \
-  --config configs/train.yaml \
-  --cache-dir ./cache/train \
-  --val-cache-dir ./cache/val \
-  --output-dir ./runs/dpies_small \
-  --override data.batch_size=2 model.hidden_dim=128 model.pair_chunk_size=32
-
-# Different budget and rival count
-python -m dpies.training.train \
-  --config configs/train.yaml \
-  --cache-dir ./cache/train \
-  --val-cache-dir ./cache/val \
-  --output-dir ./runs/dpies_B16_M6 \
-  --override selection.budget=16 selection.top_m=6
-
-# Resume
-python -m dpies.training.train \
-  --config configs/train.yaml \
-  --cache-dir ./cache/train \
-  --val-cache-dir ./cache/val \
-  --output-dir ./runs/dpies_main \
-  --resume ./runs/dpies_main/last.pt
-```
-
-Checkpoints:
-
-```text
-runs/dpies_main/last.pt
-runs/dpies_main/best.pt
-runs/dpies_main/metrics.jsonl
-runs/dpies_main/config.json
-```
-
 ---
 
-## 9. Offline validation / testing
-
-Run budget-curve evaluation on validation cache:
+## 8. Offline evaluation
 
 ```bash
 python -m dpies.evaluation.evaluate \
@@ -317,134 +319,133 @@ or:
 bash scripts/eval_offline.sh
 ```
 
-Outputs:
+The evaluator now writes `metrics.json` and `metrics.csv` with budget curves and diagnostics, including action match, top-k match, teacher regret, normalized regret, unresolved rate, Q margin, pairwise ranking accuracy, screening recall/precision, decisive-rival miss rate and evidence prediction metrics.
+
+---
+
+## 9. Official nuPlan closed-loop evaluation
+
+This repository provides a Hydra-instantiable official nuPlan planner:
 
 ```text
-runs/dpies_main/eval/metrics.json
-runs/dpies_main/eval/metrics.csv
+dpies.evaluation.closed_loop_planner.DPIESNuPlanPlanner
 ```
 
-Main metrics currently reported:
+The planner implements the official `AbstractPlanner` flow. During initialization it receives `PlannerInitialization.route_roadblock_ids`, `mission_goal`, and `map_api`. At every simulation step it reads ego history, tracked-object observations, and `PlannerInput.traffic_light_data`; builds candidate actions, interaction evidence units, exact map-aware `GeometryQuery` tensors; runs the trained DPIES model; performs capped evidence selection and max-min action selection; and returns the selected rollout as a global `InterpolatedTrajectory`.
+
+### 9.1 Planner config
+
+The included config is:
 
 ```text
-action_match          # 1[hat_a == a_star]
-teacher_regret        # J_T(hat_a) - J_T(a_star)
-unresolved_rate       # 1[Q(hat_a) <= 0]
-screen_recall_at_m    # recall of teacher rival labels by top-M screening
-selected_count        # average retained evidence units
+configs/simulation/planner/dpies_planner.yaml
 ```
 
----
-
-## 10. Method-to-code map
-
-| Paper component | Code |
-|---|---|
-| Candidate action set A_t | `dpies/actions/action_generator.py`, `rollout.py` |
-| Coverage diagnostics | `dpies/actions/coverage_metrics.py` |
-| Evidence units E_t | `dpies/evidence/evidence_builder.py` |
-| Explicit GeometryQuery | `dpies/evidence/geometry_query.py` |
-| Teacher evaluator J_T | `dpies/teacher/teacher_evaluator.py` |
-| Rival labels | `dpies/teacher/labels.py::rival_labels` |
-| Signed evidence labels | `dpies/teacher/labels.py::signed_evidence_labels` |
-| Scene/action/evidence/pair encoders | `dpies/model/encoders.py`, `network.py` |
-| Rival screening loss | `dpies/training/losses.py::screening_loss` |
-| Evidence loss | `dpies/training/losses.py::evidence_loss` |
-| Capped greedy selection | `dpies/selection/capped_greedy.py` |
-| Max-min Q action score | `dpies/selection/capped_greedy.py::compute_q_scores` |
-| Action identity and hard-negative loss | `dpies/training/losses.py` |
-
----
-
-## 11. Important implementation notes
-
-### Direct DB reading
-
-The preprocessing path reads nuPlan DBs directly through SQLite. This avoids forcing a specific nuPlan-devkit version. If your DB schema has different column names, run `schema_probe.py` and patch `dpies/data/nuplan_db.py` in one place.
-
-### HD maps
-
-`dpies/data/map_provider.py` tries to use nuPlan's map API when it is installed. If the devkit is not available, preprocessing still runs with dynamic-agent, conflict, gap, low-TTC, and coarse drivable-boundary evidence. For full paper-quality map-rule evidence, install the devkit and verify that `map_provider.extract(...)` returns non-empty polylines and rule units.
-
-### Teacher labels
-
-Logged future ego and agent tracks are used only during preprocessing for:
+The helper scripts copy it into the official devkit planner config directory:
 
 ```text
-teacher_cost
-oracle_action_index
-rival_label
-signed_evidence_label
-signed_evidence_mask
+$NUPLAN_DEVKIT_ROOT/nuplan/planning/script/config/simulation/planner/dpies_planner.yaml
 ```
 
-The model input stores only current/history-derived features and `geometry_query` constructed from current/history evidence.
+so the official `run_simulation.py` can be launched with `planner=dpies_planner`.
 
-### Discrete selection during training
-
-The selected evidence indices are treated as fixed during backpropagation. Gradients flow through selected signed evidence values, not through the greedy argmax indices.
-
-### Closed-loop nuPlan evaluation
-
-`dpies/evaluation/closed_loop_planner.py` contains the reusable DPIES planner core and a devkit adapter skeleton. The exact `PlannerInput -> cache-style tensor batch -> InterpolatedTrajectory` conversion is nuPlan-devkit-version-specific, so the offline preprocessing/training/evaluation path is the primary runnable path in this package. Once your cluster's nuPlan devkit version is fixed, implement that conversion inside `compute_planner_trajectory` using the same modules called by `preprocess_nuplan.py`.
-
----
-
-## 12. Recommended experiment sequence
-
-1. `bash scripts/smoke_test.sh`
-2. `bash scripts/inspect_db.sh`
-3. Build a small validation cache with `--max-dbs 1 --max-samples-per-db 100`.
-4. Visualize 20 random cached samples.
-5. Build full validation cache.
-6. Build a small train cache and overfit/debug.
-7. Build full train cache.
-8. Train `runs/dpies_main`.
-9. Run offline budget curves.
-10. Add stronger HD-map extraction and closed-loop adapter for final nuPlan metrics.
-
----
-
-## 13. Common failure modes
-
-### No DB files found
-
-Check:
+### 9.2 Environment variables
 
 ```bash
-find /data0/senzeyu2/dataset/nuplan/data/cache -name '*.db' | head
+export NUPLAN_DEVKIT_ROOT=/path/to/nuplan-devkit          # official v1.1 devkit checkout
+export NUPLAN_DATA_ROOT=/path/to/nuplan-v1.1              # full DB set root
+export NUPLAN_MAPS_ROOT=/path/to/nuplan/maps              # HD map root
+export NUPLAN_EXP_ROOT=/path/to/nuplan/experiments        # simulation outputs
+export CHECKPOINT=$PWD/runs/dpies_main/best.pt
+export PYTHONPATH="$PWD:$NUPLAN_DEVKIT_ROOT:${PYTHONPATH:-}"
 ```
 
-Then pass the correct subfolders with `--subdirs`.
-
-### Missing `lidar_pc`, `ego_pose`, or `lidar_box` columns
-
-Run:
+Run a tiny job first:
 
 ```bash
-python -m dpies.data.schema_probe --data-root $DATA_ROOT --limit 1
+LIMIT_SCENARIOS=1 bash scripts/run_closed_loop_nonreactive.sh
 ```
 
-Patch column names in `dpies/data/nuplan_db.py` if needed.
-
-### GPU out of memory
-
-Use:
+### 9.3 Closed-loop non-reactive agents
 
 ```bash
---override data.batch_size=1 model.hidden_dim=128 model.pair_chunk_size=16
+CHECKPOINT=$PWD/runs/dpies_main/best.pt \
+NUPLAN_DEVKIT_ROOT=/path/to/nuplan-devkit \
+NUPLAN_DATA_ROOT=/path/to/nuplan-v1.1 \
+NUPLAN_MAPS_ROOT=/path/to/nuplan/maps \
+LIMIT_SCENARIOS=20 \
+bash scripts/run_closed_loop_nonreactive.sh
 ```
 
-The signed evidence head is computed in action-pair chunks. Lower `pair_chunk_size` reduces memory.
-
-### `Q(hat_a) <= 0` often
-
-This is an unresolved retained-interface case, not automatically an action-set coverage failure. Evaluate larger budgets and larger `selection.top_m`:
+The script calls the official devkit simulation entry point with:
 
 ```bash
---override selection.budget=64 selection.top_m=8
++simulation=closed_loop_nonreactive_agents
+planner=dpies_planner
+planner.dpies_planner.checkpoint=$CHECKPOINT
 ```
 
-### Oracle is too imitation-heavy
+### 9.4 Closed-loop reactive-IDM agents
 
-Tune `TeacherWeights` in `dpies/teacher/teacher_evaluator.py`, especially `imitation_ade`, `imitation_fde`, collision/proximity, progress, and map-rule weights.
+```bash
+CHECKPOINT=$PWD/runs/dpies_main/best.pt \
+NUPLAN_DEVKIT_ROOT=/path/to/nuplan-devkit \
+NUPLAN_DATA_ROOT=/path/to/nuplan-v1.1 \
+NUPLAN_MAPS_ROOT=/path/to/nuplan/maps \
+LIMIT_SCENARIOS=20 \
+bash scripts/run_closed_loop_reactive_idm.sh
+```
+
+The script calls:
+
+```bash
++simulation=closed_loop_reactive_agents
+planner=dpies_planner
+planner.dpies_planner.checkpoint=$CHECKPOINT
+```
+
+### 9.5 Useful overrides
+
+```bash
+# CPU debugging
+DEVICE=cpu LIMIT_SCENARIOS=1 bash scripts/run_closed_loop_nonreactive.sh
+
+# Change evidence budget
+BUDGET=16 LIMIT_SCENARIOS=20 bash scripts/run_closed_loop_reactive_idm.sh
+
+# Pass arbitrary official devkit/Hydra overrides
+EXTRA_NUPLAN_ARGS="scenario_filter.scenario_types='[nearby_dense_vehicle_traffic]'" \
+  LIMIT_SCENARIOS=10 bash scripts/run_closed_loop_reactive_idm.sh
+```
+
+The legacy script names remain available:
+
+```bash
+DPIES_CHECKPOINT=$PWD/runs/dpies_main/best.pt LIMIT_TOTAL_SCENARIOS=20 bash scripts/eval_closed_loop_nonreactive.sh
+DPIES_CHECKPOINT=$PWD/runs/dpies_main/best.pt LIMIT_TOTAL_SCENARIOS=20 bash scripts/eval_closed_loop_reactive.sh
+```
+
+### 9.6 Current closed-loop implementation notes
+
+- The planner does **not** use logged future tracks or future traffic lights online. Current traffic-light data comes from `PlannerInput.traffic_light_data`; future traffic lights are only used in offline cache label construction.
+- The planner queries route roadblocks from `PlannerInitialization.route_roadblock_ids` and exact HD-map objects from `PlannerInitialization.map_api`.
+- Drivable-area containment, lane-boundary crossing, stop-line/crosswalk intersection, speed-limit violation, and route-deviation checks use structured map polygons/lines when available.
+- If online inference fails and `fallback_on_error=true`, the planner returns a conservative stop rollout instead of crashing the whole simulation. Set `planner.dpies_planner.fallback_on_error=false` when debugging.
+- Candidate action generation still uses the repository's lightweight rollout generator; for highest closed-loop quality, the next major improvement should be fully lane-centerline/lane-connector spline rollouts.
+
+## 10. Development status and important caveats
+
+Implemented in this version:
+
+- Official Scenario API preprocessing path for route roadblocks, current traffic lights, future traffic-light labels, and `scenario.map_api`.
+- Direct official DB query fallback for route roadblocks and current/future traffic-light status when available.
+- Structured HD-map rule extraction for route corridor, red traffic-light connectors, stop lines, crosswalks, drivable area, lane boundary, speed limit, and route deviation.
+- Exact map-aware `GeometryQuery` when structured geometry is present.
+- Official nuPlan `AbstractPlanner` adapter for closed-loop non-reactive and reactive-IDM simulation.
+
+Still recommended before large experiments:
+
+- Visually inspect at least 50 cached samples and 10 closed-loop scenarios using nuBoard / sample visualizations.
+- Verify `map_success`, `num_route_roadblocks`, traffic-light counts, and rule-unit counts in the preprocessing manifest.
+- Tune teacher weights after exact map-rule costs are active.
+- Replace lightweight ego-frame lane-change/merge rollouts with lane-centerline/lane-connector rollouts for stronger closed-loop performance.

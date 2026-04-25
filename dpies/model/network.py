@@ -11,7 +11,7 @@ from dpies.model.encoders import ActionEncoder, EvidenceEncoder, SceneEncoder, m
 
 @dataclass
 class DPIESConfig:
-    ego_dim: int = 8
+    ego_dim: int = 9
     agent_dim: int = 8
     map_dim: int = 4
     action_state_dim: int = 6
@@ -41,7 +41,8 @@ class DPIESNetwork(nn.Module):
 
     def encode(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         scene = self.scene_encoder(batch["ego_history"], batch["agent_history"], batch["agent_mask"],
-                                   batch["map_polylines"], batch["map_masks"])
+                                   batch["map_polylines"], batch["map_masks"],
+                                   batch.get("agent_history_mask", None))
         action_h = self.action_encoder(batch["actions"], batch["action_meta"], scene)
         evidence_h = self.evidence_encoder(batch["evidence_features"], batch["evidence_type"], scene)
         return {"scene": scene, "action_h": action_h, "evidence_h": evidence_h}

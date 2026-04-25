@@ -1,0 +1,23 @@
+# Copy or symlink this file into:
+#   $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/config/simulation/planner/dpies_planner.yaml
+# Then run run_simulation.py with planner=dpies_planner.
+dpies_planner:
+  _target_: dpies.evaluation.closed_loop_planner.DPIESNuPlanPlanner
+  _convert_: 'all'
+  checkpoint: ???
+  device: cuda
+  history_seconds: 2.0
+  future_seconds: 8.0
+  dt: 0.5
+  max_agents: 64
+  agent_radius_m: 80.0
+  max_actions: 32
+  max_evidence_units: 128
+  max_map_polylines: 256
+  max_map_points: 20
+  map_radius_m: 80.0
+  top_m: 4
+  budget: 32.0
+  eta_e: 0.05
+  gamma0: 1.0
+  fallback_on_error: true

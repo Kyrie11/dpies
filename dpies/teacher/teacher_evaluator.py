@@ -27,15 +27,30 @@ class TeacherWeights:
 
 
 class TeacherEvaluator:
-    def __init__(self, weights: TeacherWeights | None = None, local_weights: LocalCostWeights | None = None):
+    def __init__(self, weights: TeacherWeights | None = None, local_weights: LocalCostWeights | None = None, dt: float = 0.5):
         self.weights = weights or TeacherWeights()
         self.local_weights = local_weights or LocalCostWeights()
+        self.dt = float(dt)
 
     def evaluate(self, actions: np.ndarray, action_mask: np.ndarray, logged_ego_future: np.ndarray,
                  agent_future: np.ndarray, agent_mask: np.ndarray, evidence_features: np.ndarray,
-                 evidence_type: np.ndarray, evidence_mask: np.ndarray, teacher_geometry_query: np.ndarray) -> np.ndarray:
+                 evidence_type: np.ndarray, evidence_mask: np.ndarray, teacher_geometry_query: np.ndarray,
+                 agent_future_mask: np.ndarray | None = None, dt: float | None = None) -> np.ndarray:
+        costs, _ = self.evaluate_with_components(actions, action_mask, logged_ego_future, agent_future, agent_mask,
+                                                  evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
+                                                  agent_future_mask=agent_future_mask, dt=dt)
+        return costs
+
+    def evaluate_with_components(self, actions: np.ndarray, action_mask: np.ndarray, logged_ego_future: np.ndarray,
+                                 agent_future: np.ndarray, agent_mask: np.ndarray, evidence_features: np.ndarray,
+                                 evidence_type: np.ndarray, evidence_mask: np.ndarray, teacher_geometry_query: np.ndarray,
+                                 agent_future_mask: np.ndarray | None = None, dt: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+        dt = float(self.dt if dt is None else dt)
         k = actions.shape[0]
         costs = np.full((k,), 1e6, dtype=np.float32)
+        # columns: imitation_ade, imitation_fde, progress_reward, speed, accel, jerk,
+        # curvature, drivable, collision, proximity, local_sum, total
+        components = np.zeros((k, 12), dtype=np.float32)
         local = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query,
                                            evidence_mask, action_mask, self.local_weights)
         local_sum = local.sum(axis=0)
@@ -51,18 +66,20 @@ class TeacherEvaluator:
             progress = float(traj[-1, 0])
             speed_over = float(np.maximum(traj[:, 3] - 13.4, 0.0).mean())
             accel_cost = float(np.mean(np.maximum(np.abs(traj[:, 4]) - 2.5, 0.0) ** 2))
-            jerk = np.gradient(traj[:, 4], 0.5)
+            jerk = np.gradient(traj[:, 4], dt)
             jerk_cost = float(np.mean(np.maximum(np.abs(jerk) - 5.0, 0.0) ** 2))
             curv_cost = float(np.mean(np.maximum(np.abs(traj[:, 5]) - 0.25, 0.0) ** 2))
             drivable = float(np.maximum(np.max(np.abs(traj[:, 1])) - 5.25, 0.0))
-            # Direct logged-future collision/proximity proxy.
             col = 0.0
             prox = 0.0
             if agent_future.size > 0 and agent_mask.any():
-                valid = np.where(agent_mask)[0]
-                for idx in valid:
+                valid_agents = np.where(agent_mask)[0]
+                for idx in valid_agents:
                     fut = agent_future[idx, :len(traj), :2]
-                    valid_fut = np.any(np.abs(fut) > 1e-4, axis=-1)
+                    if agent_future_mask is not None and idx < agent_future_mask.shape[0]:
+                        valid_fut = agent_future_mask[idx, :len(traj)].astype(bool)
+                    else:
+                        valid_fut = np.any(np.abs(fut) > 1e-4, axis=-1)
                     if not valid_fut.any():
                         continue
                     dd = np.linalg.norm(traj[:len(fut), :2] - fut, axis=-1)
@@ -70,8 +87,8 @@ class TeacherEvaluator:
                     if m < 2.2:
                         col += 1.0 + (2.2 - m)
                     prox += np.exp(-m / 3.0)
-            cost = 0.0
             w = self.weights
+            cost = 0.0
             cost += w.imitation_ade * ade + w.imitation_fde * fde
             cost += w.route_progress * (progress / 50.0)
             cost += w.speed_limit * speed_over
@@ -79,5 +96,9 @@ class TeacherEvaluator:
             cost += w.drivable * drivable
             cost += w.collision * col + w.ttc * prox
             cost += float(local_sum[a])
+            components[a] = np.asarray([
+                ade, fde, progress / 50.0, speed_over, accel_cost, jerk_cost,
+                curv_cost, drivable, col, prox, float(local_sum[a]), float(cost)
+            ], dtype=np.float32)
             costs[a] = float(cost)
-        return costs
+        return costs, components

@@ -1,5 +1,5 @@
 model:
-  ego_dim: 8
+  ego_dim: 9
   agent_dim: 8
   map_dim: 4
   action_state_dim: 6

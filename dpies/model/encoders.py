@@ -22,23 +22,33 @@ class SceneEncoder(nn.Module):
     def __init__(self, ego_dim: int, agent_dim: int, map_dim: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
         self.ego = make_mlp(ego_dim, [hidden_dim], hidden_dim, dropout)
-        self.agent = make_mlp(agent_dim, [hidden_dim], hidden_dim, dropout)
-        self.map = make_mlp(map_dim, [hidden_dim], hidden_dim, dropout)
+        self.agent_point = make_mlp(agent_dim, [hidden_dim // 2], hidden_dim // 2, dropout)
+        self.agent_gru = nn.GRU(hidden_dim // 2, hidden_dim, batch_first=True)
+        self.map_point = make_mlp(map_dim, [hidden_dim // 2], hidden_dim // 2, dropout)
+        self.map_poly = make_mlp(hidden_dim // 2, [hidden_dim], hidden_dim, dropout)
         self.fuse = make_mlp(hidden_dim * 3, [hidden_dim], hidden_dim, dropout)
 
     def forward(self, ego_history: torch.Tensor, agent_history: torch.Tensor, agent_mask: torch.Tensor,
-                map_polylines: torch.Tensor, map_masks: torch.Tensor) -> torch.Tensor:
+                map_polylines: torch.Tensor, map_masks: torch.Tensor,
+                agent_history_mask: torch.Tensor | None = None) -> torch.Tensor:
         ego_token = self.ego(ego_history).mean(dim=1)
-        # Agent temporal mean then masked scene mean.
-        b, a, h, _ = agent_history.shape
-        agent_tok = self.agent(agent_history.reshape(b * a * h, -1)).reshape(b, a, h, -1).mean(dim=2)
+        b, a, h, d_agent = agent_history.shape
+        x = self.agent_point(agent_history.reshape(b * a * h, d_agent)).reshape(b * a, h, -1)
+        if agent_history_mask is not None:
+            # GRU does not accept arbitrary masks cheaply here; zero invalid steps so
+            # missing history no longer looks like a real object at the ego origin.
+            mh = agent_history_mask.reshape(b * a, h).float().unsqueeze(-1)
+            x = x * mh
+        _, h_last = self.agent_gru(x)
+        agent_tok = h_last[-1].reshape(b, a, -1)
         am = agent_mask.float().unsqueeze(-1)
         agent_scene = (agent_tok * am).sum(dim=1) / am.sum(dim=1).clamp_min(1.0)
-        # Map point mean per polyline then scene mean.
-        b, p, l, _ = map_polylines.shape
-        map_tok = self.map(map_polylines.reshape(b * p * l, -1)).reshape(b, p, l, -1)
+
+        b, p, l, d_map = map_polylines.shape
+        mpt = self.map_point(map_polylines.reshape(b * p * l, d_map)).reshape(b, p, l, -1)
         pm = map_masks.float().unsqueeze(-1)
-        poly = (map_tok * pm).sum(dim=2) / pm.sum(dim=2).clamp_min(1.0)
+        poly_mean = (mpt * pm).sum(dim=2) / pm.sum(dim=2).clamp_min(1.0)
+        poly = self.map_poly(poly_mean)
         poly_mask = map_masks.any(dim=2).float().unsqueeze(-1)
         map_scene = (poly * poly_mask).sum(dim=1) / poly_mask.sum(dim=1).clamp_min(1.0)
         return self.fuse(torch.cat([ego_token, agent_scene, map_scene], dim=-1))

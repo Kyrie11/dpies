@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 rm -rf /tmp/dpies_smoke
 python -m dpies.tools.make_toy_cache --output-dir /tmp/dpies_smoke/train --num-samples 16
 python -m dpies.tools.make_toy_cache --output-dir /tmp/dpies_smoke/val --num-samples 8

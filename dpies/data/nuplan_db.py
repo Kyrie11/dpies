@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from dpies.common.geometry import global_to_ego_points, quaternion_yaw, transform_state_global_to_ego, wrap_angle
+from dpies.common.geometry import quaternion_yaw, transform_agent_state_global_to_ego
 
 
 def token_to_str(token: Any) -> str:
@@ -24,13 +24,29 @@ def stable_int(token: Any, mod: int = 2_147_483_647) -> int:
     return int(h[:12], 16) % mod
 
 
+def _type_to_id(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    s = str(value).lower()
+    if "ped" in s:
+        return 1
+    if "bike" in s or "bicycle" in s or "cycl" in s:
+        return 2
+    if "vehicle" in s or "car" in s or "truck" in s or "bus" in s:
+        return 3
+    if "barrier" in s or "cone" in s or "traffic" in s:
+        return 4
+    return stable_int(s, mod=1000) + 10
+
+
 class NuPlanSQLite:
     """Small direct SQLite reader for nuPlan DB files.
 
-    The official nuPlan devkit is still recommended when available, but this
-    reader avoids a hard dependency during preprocessing. It uses schema
-    introspection and conservative fallbacks because public nuPlan DB releases
-    differ slightly in column naming.
+    This reader avoids a hard devkit dependency and uses schema introspection.
+    The expensive lidar timestamp lookup is cached as an in-memory timeline; this
+    replaces repeated `ORDER BY ABS(timestamp - ?)` full scans during preprocessing.
     """
 
     def __init__(self, db_path: str | Path):
@@ -39,6 +55,10 @@ class NuPlanSQLite:
         self.conn.row_factory = sqlite3.Row
         self._tables: Optional[set[str]] = None
         self._columns: Dict[str, List[str]] = {}
+        self._lidar_rows: Optional[List[sqlite3.Row]] = None
+        self._lidar_times: Optional[np.ndarray] = None
+        self._box_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._box_cols_cache: Optional[Dict[str, str]] = None
 
     def close(self) -> None:
         self.conn.close()
@@ -48,6 +68,23 @@ class NuPlanSQLite:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    def create_fast_indexes(self) -> None:
+        """Best-effort indexes for writable DB copies. In-memory timestamp caching is used regardless."""
+        try:
+            token_col, ts_col, _ = self._lidar_pc_base_cols()
+            self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_dpies_lidar_pc_ts ON lidar_pc({ts_col})")
+            self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_dpies_lidar_pc_token ON lidar_pc({token_col})")
+            if self.has_table("ego_pose"):
+                pose_token = "token" if "token" in self.columns("ego_pose") else self.columns("ego_pose")[0]
+                self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_dpies_ego_pose_token ON ego_pose({pose_token})")
+            if self.has_table("lidar_box"):
+                c = self._box_cols()
+                if c.get("lidar_pc_token"):
+                    self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_dpies_lidar_box_pc ON lidar_box({c['lidar_pc_token']})")
+            self.conn.commit()
+        except Exception as exc:
+            print(f"[WARN] could not create sqlite indexes for {self.db_path.name}: {exc}")
 
     @property
     def tables(self) -> set[str]:
@@ -85,15 +122,23 @@ class NuPlanSQLite:
         ego_col = "ego_pose_token" if "ego_pose_token" in cols else "ego_pose_id" if "ego_pose_id" in cols else ""
         return token_col, ts_col, ego_col
 
-    def iter_lidar_pc_rows(self, sample_interval_s: float = 1.0, limit: Optional[int] = None) -> Iterable[sqlite3.Row]:
+    def _ensure_lidar_timeline(self) -> None:
+        if self._lidar_rows is not None:
+            return
         token_col, ts_col, ego_col = self._lidar_pc_base_cols()
         if not ego_col:
             raise KeyError("lidar_pc table has no ego_pose_token/ego_pose_id column")
         q = f"SELECT {token_col} AS token, {ts_col} AS timestamp_us, {ego_col} AS ego_pose_token FROM lidar_pc ORDER BY {ts_col} ASC"
+        self._lidar_rows = list(self.conn.execute(q))
+        self._lidar_times = np.asarray([int(r["timestamp_us"]) for r in self._lidar_rows], dtype=np.int64)
+
+    def iter_lidar_pc_rows(self, sample_interval_s: float = 1.0, limit: Optional[int] = None) -> Iterable[sqlite3.Row]:
+        self._ensure_lidar_timeline()
+        assert self._lidar_rows is not None
         last_ts: Optional[int] = None
         emitted = 0
         min_delta = int(sample_interval_s * 1e6)
-        for row in self.conn.execute(q):
+        for row in self._lidar_rows:
             ts = int(row["timestamp_us"])
             if last_ts is not None and ts - last_ts < min_delta:
                 continue
@@ -104,14 +149,26 @@ class NuPlanSQLite:
                 break
 
     def lidar_rows_between(self, start_us: int, end_us: int) -> List[sqlite3.Row]:
-        token_col, ts_col, ego_col = self._lidar_pc_base_cols()
-        q = f"SELECT {token_col} AS token, {ts_col} AS timestamp_us, {ego_col} AS ego_pose_token FROM lidar_pc WHERE {ts_col} BETWEEN ? AND ? ORDER BY {ts_col} ASC"
-        return list(self.conn.execute(q, (int(start_us), int(end_us))))
+        self._ensure_lidar_timeline()
+        assert self._lidar_rows is not None and self._lidar_times is not None
+        lo = int(np.searchsorted(self._lidar_times, int(start_us), side="left"))
+        hi = int(np.searchsorted(self._lidar_times, int(end_us), side="right"))
+        return self._lidar_rows[lo:hi]
 
     def nearest_lidar_row(self, timestamp_us: int) -> Optional[sqlite3.Row]:
-        token_col, ts_col, ego_col = self._lidar_pc_base_cols()
-        q = f"SELECT {token_col} AS token, {ts_col} AS timestamp_us, {ego_col} AS ego_pose_token FROM lidar_pc ORDER BY ABS({ts_col} - ?) ASC LIMIT 1"
-        return self.conn.execute(q, (int(timestamp_us),)).fetchone()
+        self._ensure_lidar_timeline()
+        assert self._lidar_rows is not None and self._lidar_times is not None
+        if len(self._lidar_rows) == 0:
+            return None
+        idx = int(np.searchsorted(self._lidar_times, int(timestamp_us), side="left"))
+        if idx <= 0:
+            return self._lidar_rows[0]
+        if idx >= len(self._lidar_times):
+            return self._lidar_rows[-1]
+        left = idx - 1
+        if abs(int(self._lidar_times[left]) - int(timestamp_us)) <= abs(int(self._lidar_times[idx]) - int(timestamp_us)):
+            return self._lidar_rows[left]
+        return self._lidar_rows[idx]
 
     def ego_pose_by_token(self, token: Any) -> Optional[sqlite3.Row]:
         if not self.has_table("ego_pose"):
@@ -136,7 +193,7 @@ class NuPlanSQLite:
         ay = float(row["acceleration_y"] if "acceleration_y" in keys else row["accel_y"] if "accel_y" in keys else 0.0)
         yaw_rate = float(row["angular_rate_z"] if "angular_rate_z" in keys else row["yaw_rate"] if "yaw_rate" in keys else 0.0)
         speed = math.hypot(vx, vy)
-        return np.asarray([x, y, yaw, vx, vy, ax, ay, yaw_rate if yaw_rate != 0.0 else speed], dtype=np.float32)
+        return np.asarray([x, y, yaw, vx, vy, ax, ay, yaw_rate, speed], dtype=np.float32)
 
     def ego_state_at_lidar_row(self, lidar_row: sqlite3.Row) -> Optional[np.ndarray]:
         pose = self.ego_pose_by_token(lidar_row["ego_pose_token"])
@@ -163,6 +220,8 @@ class NuPlanSQLite:
         return np.stack(states, axis=0), np.asarray(times, dtype=np.int64)
 
     def _box_cols(self) -> Dict[str, str]:
+        if self._box_cols_cache is not None:
+            return self._box_cols_cache
         if not self.has_table("lidar_box"):
             raise KeyError("No lidar_box table")
         cols = self.columns("lidar_box")
@@ -171,7 +230,7 @@ class NuPlanSQLite:
                 if n in cols:
                     return n
             return default
-        return {
+        self._box_cols_cache = {
             "lidar_pc_token": first(["lidar_pc_token", "lidar_pc_id"]),
             "track_token": first(["track_token", "track_id", "token"]),
             "x": first(["x", "center_x", "tx"]),
@@ -181,13 +240,20 @@ class NuPlanSQLite:
             "width": first(["width", "size_y", "dy"], "width"),
             "vx": first(["vx", "velocity_x"], ""),
             "vy": first(["vy", "velocity_y"], ""),
+            "type": first(["category_name", "tracked_object_type", "object_type", "type", "classification"], ""),
         }
+        return self._box_cols_cache
 
     def boxes_at_lidar_token(self, lidar_token: Any) -> List[Dict[str, Any]]:
+        key = token_to_str(lidar_token)
+        if key in self._box_cache:
+            return self._box_cache[key]
         if not self.has_table("lidar_box"):
+            self._box_cache[key] = []
             return []
         c = self._box_cols()
         if not c["lidar_pc_token"]:
+            self._box_cache[key] = []
             return []
         rows = self.conn.execute(f"SELECT * FROM lidar_box WHERE {c['lidar_pc_token']}=?", (lidar_token,)).fetchall()
         out: List[Dict[str, Any]] = []
@@ -199,16 +265,19 @@ class NuPlanSQLite:
             except Exception:
                 continue
             yaw = float(r[c["yaw"]]) if c["yaw"] else 0.0
-            length = float(r[c["length"]]) if c["length"] in keys else 4.5
-            width = float(r[c["width"]]) if c["width"] in keys else 2.0
+            length = float(r[c["length"]]) if c["length"] in keys and r[c["length"]] is not None else 4.5
+            width = float(r[c["width"]]) if c["width"] in keys and r[c["width"]] is not None else 2.0
             vx = float(r[c["vx"]]) if c["vx"] and c["vx"] in keys and r[c["vx"]] is not None else 0.0
             vy = float(r[c["vy"]]) if c["vy"] and c["vy"] in keys and r[c["vy"]] is not None else 0.0
             track_token = r[c["track_token"]] if c["track_token"] else r[0]
+            typ = _type_to_id(r[c["type"]]) if c["type"] and c["type"] in keys else 0
             out.append({
                 "track_token": track_token,
                 "track_id": stable_int(track_token),
-                "state": np.asarray([x, y, yaw, vx, vy, length, width, 0.0], dtype=np.float32),
+                "type_id": int(typ),
+                "state": np.asarray([x, y, yaw, vx, vy, length, width, float(typ)], dtype=np.float32),
             })
+        self._box_cache[key] = out
         return out
 
     def current_agents(self, lidar_row: sqlite3.Row, ego_state: np.ndarray, max_agents: int, radius_m: float) -> Tuple[List[Any], np.ndarray, np.ndarray]:
@@ -219,7 +288,7 @@ class NuPlanSQLite:
         ego_yaw = float(ego_state[2])
         transformed: List[Tuple[float, Any, np.ndarray]] = []
         for b in boxes:
-            st = transform_state_global_to_ego(b["state"], ego_xy, ego_yaw)
+            st = transform_agent_state_global_to_ego(b["state"], ego_xy, ego_yaw)
             dist = float(np.linalg.norm(st[:2]))
             if dist <= radius_m:
                 transformed.append((dist, b["track_token"], st))
@@ -232,9 +301,11 @@ class NuPlanSQLite:
             mask[i] = True
         return tokens, arr, mask
 
-    def agent_history(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray, history_s: float, dt: float) -> np.ndarray:
-        times = (center_us + np.arange(-history_s, 1e-6, dt, dtype=np.float32) * 1e6).astype(np.int64)
+    def _agent_series(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray,
+                      offsets_s: np.ndarray, return_mask: bool = False) -> Tuple[np.ndarray, np.ndarray] | np.ndarray:
+        times = (center_us + offsets_s.astype(np.float32) * 1e6).astype(np.int64)
         out = np.zeros((len(tokens), len(times), 8), dtype=np.float32)
+        mask = np.zeros((len(tokens), len(times)), dtype=bool)
         token_keys = {token_to_str(t): i for i, t in enumerate(tokens)}
         ego_xy, ego_yaw = ego_state[:2], float(ego_state[2])
         for h, ts in enumerate(times):
@@ -244,22 +315,95 @@ class NuPlanSQLite:
             for b in self.boxes_at_lidar_token(row["token"]):
                 idx = token_keys.get(token_to_str(b["track_token"]))
                 if idx is not None:
-                    out[idx, h] = transform_state_global_to_ego(b["state"], ego_xy, ego_yaw)
-        return out
+                    out[idx, h] = transform_agent_state_global_to_ego(b["state"], ego_xy, ego_yaw)
+                    mask[idx, h] = True
+        return (out, mask) if return_mask else out
 
-    def agent_future(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray, future_s: float, dt: float) -> np.ndarray:
-        times = (center_us + np.arange(dt, future_s + 1e-6, dt, dtype=np.float32) * 1e6).astype(np.int64)
-        out = np.zeros((len(tokens), len(times), 8), dtype=np.float32)
-        token_keys = {token_to_str(t): i for i, t in enumerate(tokens)}
-        ego_xy, ego_yaw = ego_state[:2], float(ego_state[2])
-        for h, ts in enumerate(times):
-            row = self.nearest_lidar_row(int(ts))
-            if row is None:
+    def agent_history(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray, history_s: float,
+                      dt: float, return_mask: bool = False) -> Tuple[np.ndarray, np.ndarray] | np.ndarray:
+        offsets = np.arange(-history_s, 1e-6, dt, dtype=np.float32)
+        return self._agent_series(center_us, tokens, ego_state, offsets, return_mask=return_mask)
+
+    def agent_future(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray, future_s: float,
+                     dt: float, return_mask: bool = False) -> Tuple[np.ndarray, np.ndarray] | np.ndarray:
+        offsets = np.arange(dt, future_s + 1e-6, dt, dtype=np.float32)
+        return self._agent_series(center_us, tokens, ego_state, offsets, return_mask=return_mask)
+
+
+    def route_roadblock_ids_for_lidar_token(self, lidar_token: Any) -> List[str]:
+        """Return v1.1 route roadblock ids using the official devkit query when available."""
+        token = token_to_str(lidar_token)
+        try:
+            from nuplan.database.nuplan_db.nuplan_scenario_queries import get_roadblock_ids_for_lidarpc_token_from_db  # type: ignore
+            ids = get_roadblock_ids_for_lidarpc_token_from_db(str(self.db_path), token)
+            if ids is None:
+                return []
+            return [str(x) for x in ids]
+        except Exception:
+            pass
+        for table in ("lidar_pc", "scene", "scenario"):
+            if not self.has_table(table):
                 continue
-            for b in self.boxes_at_lidar_token(row["token"]):
-                idx = token_keys.get(token_to_str(b["track_token"]))
-                if idx is not None:
-                    out[idx, h] = transform_state_global_to_ego(b["state"], ego_xy, ego_yaw)
+            cols = self.columns(table)
+            rb_cols = [c for c in cols if "roadblock" in c.lower() and "route" in c.lower()]
+            token_cols = [c for c in cols if c in ("token", "lidar_pc_token", "initial_lidar_pc_token")]
+            if not rb_cols or not token_cols:
+                continue
+            try:
+                row = self.conn.execute(f"SELECT {rb_cols[0]} AS route FROM {table} WHERE {token_cols[0]}=? LIMIT 1", (lidar_token,)).fetchone()
+                if row and row["route"]:
+                    raw = row["route"]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="ignore")
+                    return [x.strip() for x in str(raw).replace(";", ",").split(",") if x.strip()]
+            except Exception:
+                continue
+        return []
+
+    @staticmethod
+    def _traffic_light_to_dict(raw: Any) -> Dict[str, Any]:
+        def status_name(status: Any) -> str:
+            if hasattr(status, "name"):
+                return str(status.name).upper()
+            s = str(status).split(".")[-1].upper()
+            if s in {"0", "GREEN"}:
+                return "GREEN"
+            if s in {"1", "YELLOW"}:
+                return "YELLOW"
+            if s in {"2", "RED"}:
+                return "RED"
+            return s or "UNKNOWN"
+        if isinstance(raw, dict):
+            return {
+                "status": status_name(raw.get("status")),
+                "lane_connector_id": str(raw.get("lane_connector_id", raw.get("connector_id", ""))),
+                "timestamp": int(raw.get("timestamp", raw.get("timestamp_us", 0)) or 0),
+            }
+        return {
+            "status": status_name(getattr(raw, "status", None)),
+            "lane_connector_id": str(getattr(raw, "lane_connector_id", "")),
+            "timestamp": int(getattr(raw, "timestamp", 0) or 0),
+        }
+
+    def traffic_light_statuses_for_lidar_token(self, lidar_token: Any) -> List[Dict[str, Any]]:
+        """Return current traffic light status records via the official nuPlan query."""
+        token = token_to_str(lidar_token)
+        try:
+            from nuplan.database.nuplan_db.nuplan_scenario_queries import get_traffic_light_status_for_lidarpc_token_from_db  # type: ignore
+            return [self._traffic_light_to_dict(x) for x in get_traffic_light_status_for_lidarpc_token_from_db(str(self.db_path), token)]
+        except Exception:
+            return []
+
+    def future_traffic_light_status_history(self, center_us: int, future_s: float, dt: float) -> List[List[Dict[str, Any]]]:
+        offsets = np.arange(dt, future_s + 1e-6, dt, dtype=np.float32)
+        out: List[List[Dict[str, Any]]] = []
+        for off in offsets:
+            row = self.nearest_lidar_row(int(center_us + float(off) * 1e6))
+            
+            records = self.traffic_light_statuses_for_lidar_token(row["token"]) if row is not None else []
+            for rec in records:
+                rec["relative_time_s"] = float(off)
+            out.append(records)
         return out
 
     def get_log_metadata(self) -> Dict[str, Any]:

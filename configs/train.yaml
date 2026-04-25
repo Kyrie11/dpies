@@ -4,7 +4,7 @@ data:
   num_workers: 4
   batch_size: 4
 model:
-  ego_dim: 8
+  ego_dim: 9
   agent_dim: 8
   map_dim: 4
   action_state_dim: 6
@@ -30,6 +30,7 @@ loss:
   huber_delta: 1.0
   tau_q: 1.0
   action_margin: 0.5
+  loss_on_all_pairs: false
 training:
   epochs: 20
   lr: 1.0e-4

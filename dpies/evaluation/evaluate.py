@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -16,7 +17,13 @@ except Exception:
 from dpies.common.config import load_yaml
 from dpies.common.io import ensure_dir, write_json
 from dpies.common.torch_utils import to_device
-from dpies.evaluation.offline_metrics import batch_action_metrics, screening_recall_at_m
+from dpies.evaluation.offline_metrics import (
+    batch_action_metrics,
+    decisive_rival_miss_rate,
+    evidence_prediction_metrics,
+    screening_precision_at_m,
+    screening_recall_at_m,
+)
 from dpies.model.network import DPIESConfig, DPIESNetwork
 from dpies.selection.capped_greedy import capped_greedy_select_batch, compute_q_scores, make_directed_pair_mask
 from dpies.training.collate import collate_samples
@@ -25,24 +32,34 @@ from dpies.training.dataset import EvidenceCacheDataset
 
 @torch.no_grad()
 def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: float, gamma0: float) -> dict[str, float]:
-    sums = {"action_match": 0.0, "teacher_regret": 0.0, "unresolved_rate": 0.0, "screen_recall_at_m": 0.0, "selected_count": 0.0}
+    sums: dict[str, float] = {}
     count = 0
+    elapsed = 0.0
     model.eval()
     for batch in tqdm(loader, desc=f"B={budget}"):
         batch = to_device(batch, device)
+        start = time.perf_counter()
         out = model(batch)
         pair_mask = make_directed_pair_mask(out["rival_scores"], batch["action_mask"], top_m)
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              batch["evidence_mask"], batch["evidence_cost"], budget, eta_e, gamma0)
         q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"])
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed += time.perf_counter() - start
         metrics = batch_action_metrics(q, batch["oracle_action_index"], batch["teacher_cost"], batch["action_mask"])
         metrics["screen_recall_at_m"] = screening_recall_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
+        metrics["screen_precision_at_m"] = screening_precision_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
+        metrics["decisive_rival_miss_rate"] = decisive_rival_miss_rate(pair_mask, batch["rival_label"], batch["oracle_action_index"], batch["action_mask"])
+        metrics.update(evidence_prediction_metrics(out["signed_evidence"], batch["signed_evidence_label"], batch["signed_evidence_mask"], batch["evidence_mask"], batch["action_mask"]))
         metrics["selected_count"] = float(selected.float().sum(dim=1).mean().item())
         bs = int(batch["actions"].shape[0])
         count += bs
         for k, v in metrics.items():
-            sums[k] += float(v) * bs
-    return {k: v / max(count, 1) for k, v in sums.items()}
+            sums[k] = sums.get(k, 0.0) + float(v) * bs
+    out_metrics = {k: v / max(count, 1) for k, v in sums.items()}
+    out_metrics["runtime_s_per_sample"] = float(elapsed / max(count, 1))
+    return out_metrics
 
 
 def main() -> None:

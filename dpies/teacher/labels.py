@@ -24,6 +24,7 @@ def normalize_costs(costs: np.ndarray, action_mask: np.ndarray, eps: float = 1e-
 
 
 def rival_labels(costs: np.ndarray, action_mask: np.ndarray, top_rank_l: int = 8, margin_delta: float = 0.5) -> np.ndarray:
+    """Return directed rival labels. top_rank_l means the best L actions using zero-based ranks rank < L."""
     k = len(costs)
     labels = np.zeros((k, k), dtype=bool)
     valid_idx = np.where(action_mask)[0]

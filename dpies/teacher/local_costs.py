@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dpies.common.types import EvidenceType
+from dpies.common.types import EvidenceType, MapRuleCode
 
 
 @dataclass
@@ -26,6 +26,7 @@ class LocalCostWeights:
     lambda_stop_line: float = 20.0
     lambda_crosswalk: float = 20.0
     lambda_speed_limit: float = 5.0
+    lambda_route_deviation: float = 10.0
 
 
 def local_teacher_contribution(evidence_features: np.ndarray, evidence_type: np.ndarray, geometry_query: np.ndarray,
@@ -46,13 +47,12 @@ def local_teacher_contribution(evidence_features: np.ndarray, evidence_type: np.
             cost = 0.0
             if typ in (EvidenceType.DYNAMIC_AGENT, EvidenceType.CONFLICT_POINT, EvidenceType.LOW_TTC_RISK):
                 d = max(float(q[0]), 0.0)
-                overlap = float(q[3] + q[15])
+                overlap_area = float(q[3])
                 ttc = float(q[14])
-                cost += w.lambda_overlap * overlap
+                cost += w.lambda_overlap * overlap_area
                 cost += w.lambda_distance * np.exp(-d / max(w.sigma_distance, 1e-3))
                 if ttc < w.tau0_ttc:
                     cost += w.lambda_ttc * max((w.tau0_ttc - ttc) / w.tau0_ttc, 0.0)
-                # Precedence proxy: ego arrives much earlier and too close.
                 if q[12] > 0.5 and q[0] < 2.0:
                     cost += w.lambda_yield
             elif typ == EvidenceType.GAP:
@@ -64,15 +64,23 @@ def local_teacher_contribution(evidence_features: np.ndarray, evidence_type: np.
                 cost += applies * w.lambda_rear * max(w.rear_safe_distance - rear_gap, 0.0)
                 cost += applies * w.lambda_rear_rel_speed * max(-rear_relv, 0.0)
             elif typ == EvidenceType.MAP_RULE:
+                rule_code = int(round(float(evidence_features[i, 12]))) if evidence_features.shape[-1] > 12 else 0
                 stop_cross = float(q[17])
                 crosswalk = float(q[18])
                 drv = float(q[19])
                 lane = float(q[20])
                 speed = float(q[21])
-                cost += w.lambda_stop_line * stop_cross
+                route = float(q[22])
+                if rule_code == int(MapRuleCode.TRAFFIC_LIGHT_RED):
+                    cost += w.lambda_red_light * stop_cross
+                elif rule_code == int(MapRuleCode.STOP_LINE):
+                    cost += w.lambda_stop_line * stop_cross
+                else:
+                    cost += w.lambda_stop_line * stop_cross
                 cost += w.lambda_crosswalk * crosswalk
                 cost += w.lambda_drivable * drv
                 cost += w.lambda_lane_boundary * lane
                 cost += w.lambda_speed_limit * speed
+                cost += w.lambda_route_deviation * route
             out[i, a] = p * float(cost)
     return out
