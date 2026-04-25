@@ -40,6 +40,29 @@ def _type_to_id(value: Any) -> int:
         return 4
     return stable_int(s, mod=1000) + 10
 
+def canonical_nuplan_map_name(value: str, db_name: str = "") -> str:
+    s = str(value or "").strip().lower()
+    d = str(db_name or "").strip().lower()
+    combined = f"{s} {d}"
+
+    if s in {
+        "us-ma-boston",
+        "us-nv-las-vegas-strip",
+        "us-pa-pittsburgh-hazelwood",
+        "sg-one-north",
+    }:
+        return s
+
+    if "boston" in combined or "seaport" in combined:
+        return "us-ma-boston"
+    if "vegas" in combined or "las_vegas" in combined or "las-vegas" in combined:
+        return "us-nv-las-vegas-strip"
+    if "pittsburgh" in combined or "hazelwood" in combined:
+        return "us-pa-pittsburgh-hazelwood"
+    if "singapore" in combined or "one-north" in combined or "one_north" in combined or "onenorth" in combined or "sg" in combined:
+        return "sg-one-north"
+
+    return s or "unknown"
 
 class NuPlanSQLite:
     """Small direct SQLite reader for nuPlan DB files.
@@ -432,4 +455,6 @@ class NuPlanSQLite:
                 meta["map_name"] = "us-pa-pittsburgh-hazelwood"
             else:
                 meta["map_name"] = "unknown"
+        meta["raw_map_name"] = str(meta.get("map_name", ""))
+        meta["map_name"] = canonical_nuplan_map_name(meta.get("map_name", ""), f"{self.db_path.parent.name} {self.db_path.name}")
         return meta

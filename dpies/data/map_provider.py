@@ -138,18 +138,61 @@ class NuPlanMapProvider(NullMapProvider):
     @staticmethod
     def _coords_from_candidate(cand: Any) -> Optional[np.ndarray]:
         try:
+            if cand is None:
+                return None
+
+            # Some nuPlan geometry accessors are methods.
+            if callable(cand):
+                cand = cand()
+
+            # Shapely Polygon / LineString.
+            if hasattr(cand, "exterior") and hasattr(cand.exterior, "coords"):
+                xy = np.asarray(cand.exterior.coords, dtype=np.float32)[:, :2]
+                return xy if len(xy) >= 3 else None
+
+            if hasattr(cand, "coords"):
+                xy = np.asarray(cand.coords, dtype=np.float32)[:, :2]
+                return xy if len(xy) >= 2 else None
+
+            # NuPlan BaselinePath-like.
             if hasattr(cand, "discrete_path"):
                 pts = cand.discrete_path
                 xy = np.asarray([[float(p.x), float(p.y)] for p in pts], dtype=np.float32)
                 return xy if len(xy) >= 2 else None
-            if hasattr(cand, "coords"):
-                xy = np.asarray(cand.coords, dtype=np.float32)[:, :2]
-                return xy if len(xy) >= 2 else None
-            if hasattr(cand, "exterior") and hasattr(cand.exterior, "coords"):
-                xy = np.asarray(cand.exterior.coords, dtype=np.float32)[:, :2]
-                return xy if len(xy) >= 3 else None
+
+            # Some path wrappers expose poses/states.
+            for attr in ("poses", "states", "points"):
+                if hasattr(cand, attr):
+                    pts = getattr(cand, attr)
+                    pts = pts() if callable(pts) else pts
+                    xy = []
+                    for p in pts:
+                        if hasattr(p, "x") and hasattr(p, "y"):
+                            xy.append([float(p.x), float(p.y)])
+                        elif isinstance(p, (list, tuple, np.ndarray)) and len(p) >= 2:
+                            xy.append([float(p[0]), float(p[1])])
+                    if len(xy) >= 2:
+                        return np.asarray(xy, dtype=np.float32)
+
+            # Raw list/tuple/ndarray of points.
+            if isinstance(cand, np.ndarray):
+                xy = np.asarray(cand, dtype=np.float32)
+                if xy.ndim == 2 and xy.shape[1] >= 2 and len(xy) >= 2:
+                    return xy[:, :2]
+
+            if isinstance(cand, (list, tuple)):
+                xy = []
+                for p in cand:
+                    if hasattr(p, "x") and hasattr(p, "y"):
+                        xy.append([float(p.x), float(p.y)])
+                    elif isinstance(p, (list, tuple, np.ndarray)) and len(p) >= 2:
+                        xy.append([float(p[0]), float(p[1])])
+                if len(xy) >= 2:
+                    return np.asarray(xy, dtype=np.float32)
+
         except Exception:
             return None
+
         return None
 
     @classmethod
@@ -165,8 +208,11 @@ class NuPlanMapProvider(NullMapProvider):
             "baseline_path",
             "centerline",
             "linestring",
+            "line_string",
             "left_boundary",
             "right_boundary",
+            "incoming_edges",
+            "outgoing_edges",
         )
         attr_order = line_attrs if ("STOP" in u or "BOUNDARY" in u) else polygon_attrs + line_attrs
         for attr in attr_order:
@@ -391,15 +437,24 @@ class NuPlanMapProvider(NullMapProvider):
         drivable_polygons: list[np.ndarray] = []
         n = 0
 
+        raw_layer_counts: dict[str, int] = {}
+        geom_layer_counts: dict[str, int] = {}
+        raw_object_count = 0
+        geom_object_count = 0
         try:
             iterable: list[tuple[str, Any]] = []
             if isinstance(objects, dict):
                 for layer, vals in objects.items():
-                    lname = getattr(layer, "name", str(layer))
+                    lname = str(getattr(layer, "name", str(layer)))
+                    vals = list(vals or [])
+                    raw_layer_counts[lname] = len(vals)
+                    raw_object_count += len(vals)
                     for obj in vals:
-                        iterable.append((str(lname), obj))
+                        iterable.append((lname, obj))
             else:
                 iterable = [("unknown", obj) for obj in objects]
+                raw_layer_counts["unknown"] = len(iterable)
+                raw_object_count = len(iterable)
 
             for layer, obj in iterable:
                 obj_id = self._obj_id(obj)
@@ -408,6 +463,9 @@ class NuPlanMapProvider(NullMapProvider):
                 kind, xy_global = self._geometry_from_obj(obj, layer)
                 if xy_global is None or len(xy_global) < 2:
                     continue
+
+                geom_object_count += 1
+                geom_layer_counts[layer] = geom_layer_counts.get(layer, 0) + 1
                 xy_e_full = global_to_ego_points(xy_global, ego_xy, ego_yaw).astype(np.float32)
 
                 if kind == "polygon":
@@ -546,13 +604,25 @@ class NuPlanMapProvider(NullMapProvider):
             "route_polylines": route_polyline_centers[:64],
             "traffic_lights_current": records_to_json(current_tl),
             "traffic_lights_future": records_to_json(future_tl),
+            "raw_map_object_count": int(raw_object_count),
+            "geom_map_object_count": int(geom_object_count),
+            "raw_layer_counts": raw_layer_counts,
+            "geom_layer_counts": geom_layer_counts,
         }
+
+        if n > 0:
+            map_error = ""
+        elif raw_object_count == 0:
+            map_error = f"no raw proximal map objects returned; map_name={getattr(map_api, 'map_name', '')}; radius_m={radius_m}"
+        else:
+            map_error = f"raw map objects returned but geometry extraction failed; raw_layer_counts={raw_layer_counts}"
+
         return MapObjects(
             polylines=polylines,
             masks=masks,
             rule_units=rule_units,
             success=bool(n > 0),
-            error="" if n > 0 else "no proximal map objects returned",
+            error=map_error,
             route_info=route_info,
             traffic_lights=records_to_json(current_tl),
             future_traffic_lights=records_to_json(future_tl),

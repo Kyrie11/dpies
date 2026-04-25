@@ -226,6 +226,7 @@ python -m dpies.data.preprocess_nuplan \
   --max-actions 32 \
   --max-evidence-units 128 \
   --continue-on-error
+  --require-map
 ```
 
 Script form:
