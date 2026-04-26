@@ -132,7 +132,10 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     if getattr(args, "drop_bad_action_coverage", False):
         if ade > args.max_min_ade_for_train or fde > args.max_min_fde_for_train:
             return None
-
+    logged_future_final_distance = float(np.linalg.norm(logged_future[-1, :2])) if len(logged_future) else float("inf")
+    if not getattr(args, "keep_bad_logged_future", False):
+        if logged_future_final_distance > args.max_logged_future_final_distance:
+            return None
     evidence_features, evidence_type, evidence_cost, evidence_mask = evidence_builder.build(
         agent_history, agent_mask, actions, action_mask, rule_units=map_obj.rule_units,
         dt=args.dt, agent_history_mask=agent_history_mask,
