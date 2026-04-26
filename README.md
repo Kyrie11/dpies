@@ -101,9 +101,9 @@ python -m dpies.tools.make_toy_cache --output-dir /tmp/dpies_smoke/val --num-sam
 
 python -m dpies.training.train \
   --config configs/train.yaml \
-  --cache-dir /tmp/dpies_smoke/train \
-  --val-cache-dir /tmp/dpies_smoke/val \
-  --output-dir /tmp/dpies_smoke/run \
+  --cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train \
+  --val-cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val \
+  --output-dir /data0/senzeyu2/dataset/nuplan/data/cache/run \
   --override training.epochs=1 data.batch_size=2 data.num_workers=0 model.hidden_dim=64 model.pair_chunk_size=32
 
 python -m dpies.evaluation.evaluate \

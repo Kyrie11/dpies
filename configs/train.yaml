@@ -1,6 +1,6 @@
 data:
-  train_cache_dir: ./cache/train
-  val_cache_dir: ./cache/val
+  train_cache_dir: /data0/senzeyu2/dataset/nuplan/data/cache/processed_train
+  val_cache_dir: /data0/senzeyu2/dataset/nuplan/data/cache/processed_val
   num_workers: 4
   batch_size: 4
 model:

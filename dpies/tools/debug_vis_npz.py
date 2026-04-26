@@ -166,7 +166,18 @@ def summarize_sample(path: Path, z: np.lib.npyio.NpzFile) -> dict[str, Any]:
     }
 
 
-def visualize_one(path: Path, out: Path | None = None, summary_out: Path | None = None, xlim=(-40, 90), ylim=(-55, 55), top_evidence: int = 25):
+def visualize_one(
+    path: Path,
+    out: Path | None = None,
+    summary_out: Path | None = None,
+    xlim=(-40, 90),
+    ylim=(-55, 55),
+    top_evidence: int = 25,
+    skip_drivable_union: bool = True,
+    max_exact_polygons: int = 20,
+    max_polygon_points: int = 80,
+    save_dpi: int = 120,
+):
     with np.load(path, allow_pickle=True) as z:
         meta = as_json(z["metadata_json"], {}) if "metadata_json" in z.files else {}
         ev_meta = as_json(z["evidence_metadata_json"], []) if "evidence_metadata_json" in z.files else []
@@ -225,24 +236,20 @@ def visualize_one(path: Path, out: Path | None = None, summary_out: Path | None 
                 continue
             layer = str(m.get("layer", ""))
             code = int(m.get("rule_code", 0))
-            is_hard = bool(m.get("hard_keep", False))
-            lw = 2.2 if is_hard or code in (1, 2, 4, 5, 7) else 0.9
-            alpha = 0.72 if is_hard or code in (1, 2, 4, 5, 7) else 0.38
-            for poly in m.get("polygons", [])[:80]:
-                plot_poly(ax, poly, closed=True, lw=lw, alpha=alpha)
-            if m.get("polygon"):
-                plot_poly(ax, m["polygon"], closed=True, lw=lw, alpha=alpha)
-            if m.get("polyline"):
-                plot_poly(ax, m["polyline"], closed=False, lw=lw, alpha=alpha)
-            xy = np.asarray(m.get("xy", []), dtype=float)
-            if xy.shape == (2,):
-                if "STOP" in layer or code == 1:
-                    ax.scatter([xy[0]], [xy[1]], marker="s", s=55, label="stop/map-rule" if "stop/map-rule" not in ax.get_legend_handles_labels()[1] else None)
-                elif "TRAFFIC_LIGHT" in layer or code == 4:
-                    ax.scatter([xy[0]], [xy[1]], marker="*", s=80, label="traffic light/red" if "traffic light/red" not in ax.get_legend_handles_labels()[1] else None)
-                elif "CROSSWALK" in layer or code == 2:
-                    ax.scatter([xy[0]], [xy[1]], marker="D", s=35, label="crosswalk" if "crosswalk" not in ax.get_legend_handles_labels()[1] else None)
 
+            if skip_drivable_union and layer == "DRIVABLE_AREA_UNION":
+                xy = np.asarray(m.get("xy", []), dtype=float)
+                if xy.shape == (2,):
+                    ax.scatter([xy[0]], [xy[1]], marker=".", s=20, alpha=0.4, label="drivable union centroid")
+                continue
+
+            polygons = m.get("polygons", []) or []
+            for poly in polygons[:max_exact_polygons]:
+                arr = np.asarray(poly, dtype=float)
+                if arr.ndim == 2 and arr.shape[0] > max_polygon_points:
+                    step = max(1, int(np.ceil(arr.shape[0] / max_polygon_points)))
+                    arr = arr[::step]
+                plot_poly(ax, arr, closed=True, lw=lw, alpha=alpha)
         # Agents: current boxes and future tracks.
         for i in np.where(agent_mask)[0]:
             if i >= agent_hist.shape[0]:
@@ -358,7 +365,7 @@ def visualize_one(path: Path, out: Path | None = None, summary_out: Path | None 
         fig.tight_layout()
         if out:
             out.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out, dpi=180, bbox_inches="tight")
+            fig.savefig(out, dpi=save_dpi, bbox_inches="tight")
             plt.close(fig)
         else:
             plt.show()
@@ -386,7 +393,14 @@ def main() -> None:
     p.add_argument("--xlim", nargs=2, type=float, default=(-40.0, 90.0))
     p.add_argument("--ylim", nargs=2, type=float, default=(-55.0, 55.0))
     p.add_argument("--top-evidence", type=int, default=25)
+    p.add_argument("--skip-drivable-union", action="store_true", default=True)
+    p.add_argument("--draw-drivable-union", action="store_true")
+    p.add_argument("--max-exact-polygons", type=int, default=20)
+    p.add_argument("--max-polygon-points", type=int, default=80)
+    p.add_argument("--save-dpi", type=int, default=120)
     args = p.parse_args()
+    if args.draw_drivable_union:
+        args.skip_drivable_union = False
 
     samples = iter_samples(args.input, args.limit)
     if not samples:
@@ -401,7 +415,18 @@ def main() -> None:
             out_dir = args.out_dir or args.input / "debug_viz"
             out = out_dir / f"{sample.stem}_debug.png"
             summary_out = out_dir / f"{sample.stem}_summary.json"
-        all_summaries.append(visualize_one(sample, out=out, summary_out=summary_out, xlim=tuple(args.xlim), ylim=tuple(args.ylim), top_evidence=args.top_evidence))
+        all_summaries.append(visualize_one(
+    sample,
+    out=out,
+    summary_out=summary_out,
+    xlim=tuple(args.xlim),
+    ylim=tuple(args.ylim),
+    top_evidence=args.top_evidence,
+    skip_drivable_union=args.skip_drivable_union,
+    max_exact_polygons=args.max_exact_polygons,
+    max_polygon_points=args.max_polygon_points,
+    save_dpi=args.save_dpi,
+))
         if out:
             print(f"wrote {out}")
 
