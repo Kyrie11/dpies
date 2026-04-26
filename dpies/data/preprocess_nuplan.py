@@ -129,13 +129,15 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
 
     ade, fde = min_ade_fde(actions, action_mask, logged_future)
 
-    if getattr(args, "drop_bad_action_coverage", False):
+    if not getattr(args, "keep_bad_action_coverage", False):
         if ade > args.max_min_ade_for_train or fde > args.max_min_fde_for_train:
             return None
+
     logged_future_final_distance = float(np.linalg.norm(logged_future[-1, :2])) if len(logged_future) else float("inf")
     if not getattr(args, "keep_bad_logged_future", False):
         if logged_future_final_distance > args.max_logged_future_final_distance:
             return None
+
     evidence_features, evidence_type, evidence_cost, evidence_mask = evidence_builder.build(
         agent_history, agent_mask, actions, action_mask, rule_units=map_obj.rule_units,
         dt=args.dt, agent_history_mask=agent_history_mask,
@@ -263,10 +265,10 @@ def main() -> None:
     p.add_argument("--skip-existing", action="store_true", help="do not overwrite existing sample_*.npz when resuming an interrupted cache build")
     p.add_argument("--create-sqlite-indexes", action="store_true", help="best-effort CREATE INDEX for writable DB copies; in-memory caching is always used")
     p.add_argument("--continue-on-error", action="store_true")
-    p.add_argument("--drop-bad-action-coverage", action="store_true")
+    p.add_argument("--keep-bad-action-coverage", action="store_true")
     p.add_argument("--max-min-ade-for-train", type=float, default=25.0)
     p.add_argument("--max-min-fde-for-train", type=float, default=35.0)
-    p.add_argument("--drop-bad-logged-future", action="store_true")
+    p.add_argument("--keep-bad-logged-future", action="store_true")
     p.add_argument("--max-logged-future-final-distance", type=float, default=160.0)
     args = p.parse_args()
 
