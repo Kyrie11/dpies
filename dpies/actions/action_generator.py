@@ -46,7 +46,14 @@ class ActionGenerator:
         speed_xy = float(np.linalg.norm(cur[3:5])) if cur.shape[-1] >= 5 else 0.0
         speed_col = float(cur[8]) if cur.shape[-1] >= 9 else speed_xy
         # Column 7 is yaw_rate in the new schema and must not be used as speed.
-        return max(speed_xy, speed_col, 0.0)
+        hist_speed = 0.0
+        if ego_history.shape[0] >= 2:
+            # ego_history 已经在当前 ego frame 下，最后一帧通常接近 (0, 0)
+            p0 = ego_history[-2, :2]
+            p1 = ego_history[-1, :2]
+            hist_speed = float(np.linalg.norm(p1 - p0) / max(self.cfg.dt, 1e-3))
+
+        return max(speed_xy, speed_col, hist_speed, 0.0)
 
     def _stop_distances_from_rules(self, rule_units: list[dict] | None) -> list[float]:
         stops: list[float] = []
@@ -138,7 +145,13 @@ class ActionGenerator:
             float(np.clip(current_speed * self.cfg.horizon_s * m, 20.0, self.cfg.max_terminal_progress_m))
             for m in self.cfg.coverage_horizon_speed_multipliers
         ]
-        base_progress = sorted(set([20.0, 35.0, 50.0] + [round(p, 2) for p in speed_progress]))
+        base_progress = sorted(set([
+            20.0, 35.0, 50.0,
+            round(current_speed * self.cfg.horizon_s * 0.75, 2),
+            round(current_speed * self.cfg.horizon_s * 1.0, 2),
+            round(current_speed * self.cfg.horizon_s * 1.25, 2),
+        ]))
+        base_progress = [float(np.clip(p, 5.0, self.cfg.max_terminal_progress_m)) for p in base_progress]
         for vtar in speed_candidates:
             for progress in base_progress:
                 traj = kinematic_rollout(current_speed, vtar, 0.0, self.cfg.horizon_s, self.cfg.dt, progress)
