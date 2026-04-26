@@ -135,10 +135,25 @@ class EvidenceBuilder:
                 units.append((self._relevance(feat, EvidenceType.CONFLICT_POINT, hard_keep=True), True, EvidenceType.CONFLICT_POINT, feat, meta))
                 conf_count += 1
 
-        # Gap units for left/right target corridors. This is still a geometry fallback;
-        # map-aware target-lane projection can replace the corridor logic later.
+        # Gap units for left/right target corridors. Prefer map-supported corridors;
+        # fall back only when no rule_units exist. This prevents fake gaps in places
+        # without adjacent lane support.
         gap_count = 0
         for side, lane_y in ((1.0, self.cfg.lane_width_m), (-1.0, -self.cfg.lane_width_m)):
+            if rule_units:
+                supported = False
+                for ru in rule_units:
+                    layer = str(ru.get("layer", "")).upper()
+                    if not any(k in layer for k in ("LANE", "CONNECTOR", "ROADBLOCK", "ROUTE_CORRIDOR", "DRIVABLE")):
+                        continue
+                    pts = np.asarray(ru.get("polyline", ru.get("polygon", ru.get("xy", []))), dtype=np.float32).reshape(
+                        -1, 2)
+                    if len(pts) and np.count_nonzero((pts[:, 0] > 0.0) & (pts[:, 0] < 70.0) & (
+                            np.abs(pts[:, 1] - lane_y) < self.cfg.lane_width_m)) >= 2:
+                        supported = True
+                        break
+                if not supported:
+                    continue
             near = []
             for idx in valid_agents:
                 st = self._last_valid_agent_state(agent_history, agent_history_mask, int(idx))
@@ -169,6 +184,8 @@ class EvidenceBuilder:
         # tensor carries compact numeric hints.
         map_count = 0
         for ru in rule_units or []:
+            if map_count >= self.cfg.max_map_rule:
+                break
             xy = np.asarray(ru.get("xy", [0.0, 0.0]), dtype=np.float32)
             if xy.shape[0] < 2:
                 xy = np.asarray([0.0, 0.0], dtype=np.float32)
@@ -217,13 +234,27 @@ class EvidenceBuilder:
             units.append((self._relevance(feat, EvidenceType.MAP_RULE, hard_keep=hard), hard, EvidenceType.MAP_RULE, feat, meta))
             map_count += 1
 
+        # Optional: include coarse boundaries only if map-rule quota has room.
+        coarse_count = 0
         # Always include coarse drivable/lane-boundary rule tokens in the ego frame.
         for side, y in ((1.0, self.cfg.lane_width_m * 1.5), (-1.0, -self.cfg.lane_width_m * 1.5)):
+            if map_count + coarse_count >= self.cfg.max_map_rule:
+                break
             feat = self._feature(EvidenceType.MAP_RULE, 25.0, y, 0.0, 0.0, 0.0, 0.0, abs(y), 99.0, 0.75, -1,
                                  [float(MapRuleCode.LANE_BOUNDARY), side])
             meta = {"type": "map_rule", "layer": "coarse_lane_boundary", "rule_code": int(MapRuleCode.LANE_BOUNDARY), "side": float(side)}
             units.append((self._relevance(feat, EvidenceType.MAP_RULE), False, EvidenceType.MAP_RULE, feat, meta))
-
+            coarse_count += 1
+        # Stronger per-type cap after hard_keep scoring, so one evidence family cannot
+        # consume the whole max_units budget. Critical hard units still sort first
+        # within their family.
+        per_type_limit = {
+            EvidenceType.DYNAMIC_AGENT: self.cfg.max_dynamic,
+            EvidenceType.CONFLICT_POINT: self.cfg.max_conflict,
+            EvidenceType.GAP: self.cfg.max_gap,
+            EvidenceType.MAP_RULE: self.cfg.max_map_rule,
+            EvidenceType.LOW_TTC_RISK: self.cfg.max_risk,
+        }
         # Low-TTC/proximity risk units.
         risk_count = 0
         for idx in valid_agents:
@@ -248,7 +279,16 @@ class EvidenceBuilder:
         soft_units = [u for u in units if not u[1]]
         hard_units.sort(key=lambda u: u[0], reverse=True)
         soft_units.sort(key=lambda u: u[0], reverse=True)
-        kept = (hard_units + soft_units)[: self.cfg.max_units]
+        kept = []
+        type_counts = {k: 0 for k in per_type_limit}
+        for u in hard_units + soft_units:
+            typ = u[2]
+            if type_counts.get(typ, 0) >= per_type_limit.get(typ, self.cfg.max_units):
+                continue
+            kept.append(u)
+            type_counts[typ] = type_counts.get(typ, 0) + 1
+            if len(kept) >= self.cfg.max_units:
+                break
         features = np.zeros((self.cfg.max_units, EVIDENCE_DIM), dtype=np.float32)
         type_ids = np.full((self.cfg.max_units,), int(EvidenceType.PADDING), dtype=np.int64)
         costs = np.ones((self.cfg.max_units,), dtype=np.float32)

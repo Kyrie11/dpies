@@ -21,7 +21,8 @@ class ActionGeneratorConfig:
     max_curvature: float = 0.35
     lane_width_m: float = 3.5
     allow_topology_fallback_lane_changes: bool = True
-
+    require_route_for_merge: bool = True
+    lateral_corridor_margin_m: float = 1.25
 
 class ActionGenerator:
     def __init__(self, cfg: ActionGeneratorConfig):
@@ -58,12 +59,55 @@ class ActionGenerator:
             stops = [4.0, 8.0, 12.0, 18.0]
         return sorted(set(round(float(s), 2) for s in stops))[:6]
 
+    @staticmethod
+    def _points_from_rule(ru: dict) -> np.ndarray:
+        for key in ("polyline", "polygon"):
+            pts = np.asarray(ru.get(key, []), dtype=np.float32)
+            if pts.ndim == 2 and pts.shape[1] >= 2 and len(pts) >= 2:
+                return pts[:, :2]
+        polys = ru.get("polygons", [])
+        if polys:
+            chunks = []
+            for p in polys:
+                arr = np.asarray(p, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) >= 2:
+                    chunks.append(arr[:, :2])
+            if chunks:
+                return np.concatenate(chunks, axis=0)
+        xy = np.asarray(ru.get("xy", []), dtype=np.float32)
+        return xy.reshape(1, 2) if xy.shape == (2,) else np.zeros((0, 2), dtype=np.float32)
+
+    def _corridor_has_map_support(self, rule_units: list[dict] | None, target_y: float, *,
+                                  want_route: bool = False) -> bool:
+        if not rule_units:
+            return False
+        for ru in rule_units:
+            layer = str(ru.get("layer", "")).upper()
+            if want_route and layer != "ROUTE_CORRIDOR" and not bool(ru.get("is_route", False)):
+                continue
+            if not any(k in layer for k in ("LANE", "CONNECTOR", "ROADBLOCK", "ROUTE_CORRIDOR", "DRIVABLE")):
+                continue
+            pts = self._points_from_rule(ru)
+            if pts.size == 0:
+                continue
+            forward = (pts[:, 0] > 0.0) & (pts[:, 0] < 70.0)
+            lateral = np.abs(pts[:, 1] - target_y) < (self.cfg.lane_width_m * 0.5 + self.cfg.lateral_corridor_margin_m)
+            if np.count_nonzero(forward & lateral) >= 2:
+                return True
+        return False
+
     def _lane_change_sides(self, rule_units: list[dict] | None) -> list[tuple[float, ActionMode]]:
-        # Without reliable topology, keep old fallback lane-change candidates. If map
-        # boundary tokens exist very close to one side, avoid the grossly invalid side.
-        if self.cfg.allow_topology_fallback_lane_changes:
-            return [(self.cfg.lane_width_m, ActionMode.LANE_CHANGE_LEFT), (-self.cfg.lane_width_m, ActionMode.LANE_CHANGE_RIGHT)]
-        return []
+        sides = []
+        for lat, mode in (
+        (self.cfg.lane_width_m, ActionMode.LANE_CHANGE_LEFT), (-self.cfg.lane_width_m, ActionMode.LANE_CHANGE_RIGHT)):
+            if self._corridor_has_map_support(rule_units, lat, want_route=False):
+                sides.append((lat, mode))
+        if sides or not self.cfg.allow_topology_fallback_lane_changes:
+            return sides
+        # Fallback is only for smoke tests / incomplete map. Disable for final experiments.
+        return [(self.cfg.lane_width_m, ActionMode.LANE_CHANGE_LEFT),
+                (-self.cfg.lane_width_m, ActionMode.LANE_CHANGE_RIGHT)]
+
 
     def generate(self, ego_history: np.ndarray, agent_history: np.ndarray | None = None, agent_mask: np.ndarray | None = None,
                  map_context: Any | None = None, rule_units: list[dict] | None = None,
@@ -107,7 +151,10 @@ class ActionGenerator:
                         actions.append(self._make(mode, traj, vtar, lat, progress))
         # Lightweight merge candidates: lateral transition toward the same adjacent-lane geometry,
         # tagged separately so gap evidence can learn merge-specific preferences.
-        for lat in (self.cfg.lane_width_m, -self.cfg.lane_width_m):
+        merge_lats = [lat for lat, _ in self._lane_change_sides(rule_units)]
+        if self.cfg.require_route_for_merge:
+            merge_lats = [lat for lat in merge_lats if self._corridor_has_map_support(rule_units, lat, want_route=True)]
+        for lat in merge_lats:
             for progress in (30.0, 45.0):
                 traj = kinematic_rollout(current_speed, max(2.0, current_speed), lat, self.cfg.horizon_s, self.cfg.dt, progress)
                 if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):

@@ -450,3 +450,10 @@ Still recommended before large experiments:
 - Verify `map_success`, `num_route_roadblocks`, traffic-light counts, and rule-unit counts in the preprocessing manifest.
 - Tune teacher weights after exact map-rule costs are active.
 - Replace lightweight ego-frame lane-change/merge rollouts with lane-centerline/lane-connector rollouts for stronger closed-loop performance.
+
+
+## 11. Test generated npz file 
+
+```bash
+python scripts/check_npz_cache.py   --cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train   --limit 1000   --show-files 5
+```

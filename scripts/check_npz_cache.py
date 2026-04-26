@@ -82,7 +82,7 @@ def check_file(path: Path):
         "has_speed_limit": has_speed,
         "layers": Counter(layers),
         "shapes": {k: _shape(d, k) for k in d.files},
-        "action_valid_count": int(np.asarray(d["action_valid_mask"]).sum()) if "action_valid_mask" in d.files else -1,
+        "action_valid_count": int(np.asarray(d["action_mask"]).sum()) if "action_mask" in d.files else int(np.asarray(d["action_valid_mask"]).sum()) if "action_valid_mask" in d.files else -1,
         "evidence_valid_count": int(np.asarray(d["evidence_mask"]).sum()) if "evidence_mask" in d.files else -1,
         "teacher_cost_finite": bool(np.isfinite(d["teacher_cost"]).all()) if "teacher_cost" in d.files else False,
         "geometry_query_finite": bool(np.isfinite(d["geometry_query"]).all()) if "geometry_query" in d.files else False,
