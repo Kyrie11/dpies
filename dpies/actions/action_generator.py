@@ -40,7 +40,7 @@ class ActionGenerator:
             ], dtype=np.float32),
         }
 
-    @staticmethod
+
     def _current_speed(ego_history: np.ndarray) -> float:
         cur = ego_history[-1]
         speed_xy = float(np.linalg.norm(cur[3:5])) if cur.shape[-1] >= 5 else 0.0
