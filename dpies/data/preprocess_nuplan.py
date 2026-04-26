@@ -263,6 +263,8 @@ def main() -> None:
     p.add_argument("--drop-bad-action-coverage", action="store_true")
     p.add_argument("--max-min-ade-for-train", type=float, default=25.0)
     p.add_argument("--max-min-fde-for-train", type=float, default=35.0)
+    p.add_argument("--drop-bad-logged-future", action="store_true")
+    p.add_argument("--max-logged-future-final-distance", type=float, default=160.0)
     args = p.parse_args()
 
     out_dir = ensure_dir(args.output_dir)
