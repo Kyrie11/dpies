@@ -23,6 +23,8 @@ class ActionGeneratorConfig:
     allow_topology_fallback_lane_changes: bool = True
     require_route_for_merge: bool = True
     lateral_corridor_margin_m: float = 1.25
+    max_terminal_progress_m: float = 180.0
+    coverage_horizon_speed_multipliers: tuple[float, ...] = (0.75, 1.0, 1.25)
 
 class ActionGenerator:
     def __init__(self, cfg: ActionGeneratorConfig):
@@ -129,8 +131,16 @@ class ActionGenerator:
             min(self.cfg.speed_limit_mps, 8.0),
         ]))
         actions: List[dict] = []
+        # Progress must scale with current speed; otherwise high-speed scenes get bad
+        # minADE/minFDE labels and the teacher learns from an action set that cannot
+        # represent the logged future.
+        speed_progress = [
+            float(np.clip(current_speed * self.cfg.horizon_s * m, 20.0, self.cfg.max_terminal_progress_m))
+            for m in self.cfg.coverage_horizon_speed_multipliers
+        ]
+        base_progress = sorted(set([20.0, 35.0, 50.0] + [round(p, 2) for p in speed_progress]))
         for vtar in speed_candidates:
-            for progress in (20.0, 35.0, 50.0):
+            for progress in base_progress:
                 traj = kinematic_rollout(current_speed, vtar, 0.0, self.cfg.horizon_s, self.cfg.dt, progress)
                 if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):
                     mode = ActionMode.PROCEED if vtar > current_speed + 1.0 else ActionMode.KEEP
@@ -145,7 +155,7 @@ class ActionGenerator:
                 actions.append(self._make(ActionMode.CREEP, traj, 2.0, 0.0, progress))
         for lat, mode in self._lane_change_sides(rule_units):
             for vtar in (max(1.0, current_speed), min(self.cfg.speed_limit_mps, current_speed + 2.0)):
-                for progress in (25.0, 40.0, 55.0):
+                for progress in sorted(set([25.0, 40.0, 55.0] + [p for p in base_progress if p >= 25.0])):
                     traj = kinematic_rollout(current_speed, vtar, lat, self.cfg.horizon_s, self.cfg.dt, progress)
                     if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):
                         actions.append(self._make(mode, traj, vtar, lat, progress))
@@ -155,7 +165,7 @@ class ActionGenerator:
         if self.cfg.require_route_for_merge:
             merge_lats = [lat for lat in merge_lats if self._corridor_has_map_support(rule_units, lat, want_route=True)]
         for lat in merge_lats:
-            for progress in (30.0, 45.0):
+            for progress in sorted(set([30.0, 45.0] + [p for p in base_progress if p >= 30.0])):
                 traj = kinematic_rollout(current_speed, max(2.0, current_speed), lat, self.cfg.horizon_s, self.cfg.dt, progress)
                 if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):
                     actions.append(self._make(ActionMode.MERGE, traj, max(2.0, current_speed), lat, progress))

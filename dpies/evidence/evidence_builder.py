@@ -182,8 +182,27 @@ class EvidenceBuilder:
         # Map-rule units from optional map API. Rule metadata preserves exact
         # ego-frame polylines/polygons for GeometryQuery, while the fixed feature
         # tensor carries compact numeric hints.
+        def _rule_priority(ru: dict) -> tuple[int, float]:
+            # Lower is better. Keep safety / route geometry before generic lane connectors.
+            layer = str(ru.get("layer", "")).upper()
+            code = int(ru.get("rule_code", 0) or 0)
+            xy = np.asarray(ru.get("xy", [0.0, 0.0]), dtype=np.float32)
+            dist = float(np.linalg.norm(xy[:2])) if xy.shape[0] >= 2 else 1e6
+            if layer == "DRIVABLE_AREA_UNION": return (0, dist)
+            if layer == "ROUTE_CORRIDOR": return (1, dist)
+            if "TRAFFIC_LIGHT" in layer or code == int(MapRuleCode.TRAFFIC_LIGHT_RED): return (2, dist)
+            if code == int(MapRuleCode.STOP_LINE) or "STOP" in layer: return (3, dist)
+            if code == int(MapRuleCode.CROSSWALK) or "CROSSWALK" in layer: return (4, dist)
+            if code == int(MapRuleCode.LANE_BOUNDARY): return (5, dist)
+            if code == int(MapRuleCode.INTERSECTION) or "INTERSECTION" in layer: return (6, dist)
+            if code == int(MapRuleCode.SPEED_LIMIT) or layer == "SPEED_LIMIT": return (7, dist)
+            if bool(ru.get("is_route", False)): return (8, dist)
+            if code == int(MapRuleCode.LANE_CONNECTOR) or "CONNECTOR" in layer: return (9, dist)
+            return (10, dist)
+
+        prioritized_rules = sorted(list(rule_units or []), key=_rule_priority)
         map_count = 0
-        for ru in rule_units or []:
+        for ru in prioritized_rules:
             if map_count >= self.cfg.max_map_rule:
                 break
             xy = np.asarray(ru.get("xy", [0.0, 0.0]), dtype=np.float32)
@@ -231,7 +250,9 @@ class EvidenceBuilder:
                 "roadblock_id": str(ru.get("roadblock_id", "")),
                 "is_route": bool(ru.get("is_route", False)),
             }
-            units.append((self._relevance(feat, EvidenceType.MAP_RULE, hard_keep=hard), hard, EvidenceType.MAP_RULE, feat, meta))
+            # Rule-priority already controls cross-type content. Relevance controls order within type.
+            units.append(
+                (self._relevance(feat, EvidenceType.MAP_RULE, hard_keep=hard), hard, EvidenceType.MAP_RULE, feat, meta))
             map_count += 1
 
         # Optional: include coarse boundaries only if map-rule quota has room.

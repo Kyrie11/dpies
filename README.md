@@ -291,8 +291,8 @@ python -m dpies.tools.visualize_sample \
 ```bash
 python -m dpies.training.train \
   --config configs/train.yaml \
-  --cache-dir ./cache/train \
-  --val-cache-dir ./cache/val \
+  --cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train \
+  --val-cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val \
   --output-dir ./runs/dpies_main
 ```
 
