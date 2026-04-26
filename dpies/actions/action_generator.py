@@ -41,7 +41,7 @@ class ActionGenerator:
         }
 
 
-    def _current_speed(ego_history: np.ndarray) -> float:
+    def _current_speed(self, ego_history: np.ndarray) -> float:
         cur = ego_history[-1]
         speed_xy = float(np.linalg.norm(cur[3:5])) if cur.shape[-1] >= 5 else 0.0
         speed_col = float(cur[8]) if cur.shape[-1] >= 9 else speed_xy
