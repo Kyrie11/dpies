@@ -279,7 +279,6 @@ def main() -> None:
     p.add_argument("--keep-bad-logged-future", action="store_true")
     p.add_argument("--max-logged-future-final-distance", type=float, default=160.0)
     p.add_argument("--num-workers", type=int, default=1)
-    p.add_argument("--samples-per-db-subdir", action=args.BooleanOptionalAction, default=True)
     p.add_argument("--slim-cache", action="store_true",
                    help="omit large debug JSON fields after labels/query have been computed")
     args = p.parse_args()
