@@ -377,9 +377,11 @@ def visualize_one(
 
 
 def iter_samples(path: Path, limit: int) -> list[Path]:
-    if path.is_file():
-        return [path]
-    files = sorted(path.glob("sample_*.npz"))
+    if path.is_dir():
+        files = sorted(path.rglob("*.npz"))
+    else:
+        files = [path]
+
     return files[:limit] if limit > 0 else files
 
 

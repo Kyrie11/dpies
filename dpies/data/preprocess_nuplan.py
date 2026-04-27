@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import traceback
+import hashlib
 from pathlib import Path
 from typing import Any, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -187,7 +188,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         "dt": float(args.dt),
         "ego_dim": int(ego_history.shape[-1]),
     }
-    return {
+    sample = {
         "ego_history": ego_history.astype(np.float32),
         "ego_global_state": current.astype(np.float32),
         "ego_to_global": ego_pose_to_transform(current[:2], float(current[2])).astype(np.float32),
@@ -222,6 +223,12 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         "traffic_lights_json": json_bytes({"current": traffic_lights_current, "future": traffic_lights_future}),
     }
 
+    if getattr(args, "slim_cache", False):
+        sample.pop("evidence_metadata_json", None)
+        sample.pop("route_info_json", None)
+        sample.pop("traffic_lights_json", None)
+
+    return sample
 
 def save_sample(path: Path, sample: Dict[str, np.ndarray], compress: bool = False) -> None:
     if compress:
@@ -272,7 +279,9 @@ def main() -> None:
     p.add_argument("--keep-bad-logged-future", action="store_true")
     p.add_argument("--max-logged-future-final-distance", type=float, default=160.0)
     p.add_argument("--num-workers", type=int, default=1)
-    p.add_argument("--samples-per-db-subdir", action="store_true", default=True)
+    p.add_argument("--samples-per-db-subdir", action=args.BooleanOptionalAction, default=True)
+    p.add_argument("--slim-cache", action="store_true",
+                   help="omit large debug JSON fields after labels/query have been computed")
     args = p.parse_args()
 
     out_dir = ensure_dir(args.output_dir)
@@ -310,6 +319,10 @@ def main() -> None:
         "num_dbs": len(db_files),
     })
 
+def db_output_name(db_path: Path) -> str:
+    h = hashlib.sha1(str(db_path.resolve()).encode("utf-8")).hexdigest()[:8]
+    return f"{db_path.stem}_{h}"
+
 def process_one_db_worker(payload: tuple[str, dict]) -> dict:
     db_path_str, args_dict = payload
     args = argparse.Namespace(**args_dict)
@@ -318,7 +331,10 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
     out_root = ensure_dir(args.output_dir)
 
     # 每个 DB 写入独立子目录，避免多进程争抢 sample_id。
-    db_out = ensure_dir(out_root / db_path.stem)
+    db_name = db_output_name(db_path)
+    db_out = ensure_dir(out_root / db_name)
+    name = f"{db_name}_{written:09d}.npz"
+
 
     map_provider = NuPlanMapProvider(
         args.map_root,
@@ -375,15 +391,21 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
                         continue
 
                     name = f"{db_path.stem}_{written:09d}.npz"
-                    save_sample(db_out / name, sample, args.compress)
+
+                    out_path = db_out / name
+                    if args.skip_existing and out_path.exists():
+                        written += 1
+                        continue
+
+                    save_sample(out_path, sample, args.compress)
 
                     meta = safe_json_scalar(sample["metadata_json"])
                     meta["file"] = str(Path(db_path.stem) / name)
                     manifest_rows.append(meta)
                     written += 1
 
-                    if args.max_samples_total is not None and written >= args.max_samples_total:
-                        break
+                    # if args.max_samples_total is not None and written >= args.max_samples_total:
+                    #     break
 
                 except Exception as exc:
                     failures += 1

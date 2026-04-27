@@ -148,7 +148,7 @@ def main():
     ap.add_argument('--show-files', type=int, default=5)
     ap.add_argument('--json-out', default='')
     args = ap.parse_args()
-    files = sorted(Path(args.cache_dir).glob('sample_*.npz'))
+    files = sorted(Path(args.cache_dir).rglob("*.npz"))
     if args.limit > 0: files = files[:args.limit]
     rows = [check_file(f) for f in files]
     print('cache_dir:', args.cache_dir)
