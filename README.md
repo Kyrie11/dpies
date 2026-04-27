@@ -138,7 +138,7 @@ Recommended validation cache command:
 python -m dpies.data.preprocess_nuplan \
   --data-root /data0/senzeyu2/dataset/nuplan/data/cache \
   --map-root /data0/senzeyu2/dataset/nuplan/maps \
-  --output-dir ./cache/val \
+  --output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val \
   --subdirs val \
   --sample-interval-s 1.0 \
   --history-seconds 2.0 \

@@ -6,6 +6,7 @@ import os
 import traceback
 from pathlib import Path
 from typing import Any, Dict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -270,6 +271,8 @@ def main() -> None:
     p.add_argument("--max-min-fde-for-train", type=float, default=35.0)
     p.add_argument("--keep-bad-logged-future", action="store_true")
     p.add_argument("--max-logged-future-final-distance", type=float, default=160.0)
+    p.add_argument("--num-workers", type=int, default=1)
+    p.add_argument("--samples-per-db-subdir", action="store_true", default=True)
     args = p.parse_args()
 
     out_dir = ensure_dir(args.output_dir)
@@ -277,73 +280,142 @@ def main() -> None:
     if not db_files:
         raise FileNotFoundError(f"No .db files found under {args.data_root} with subdirs={args.subdirs}")
     write_json(out_dir / "preprocess_args.json", vars(args) | {"num_db_files": len(db_files)})
-    map_provider = NuPlanMapProvider(args.map_root, args.max_map_polylines, args.max_map_points, map_version=args.map_version)
-    scenario_extractor = None
-    if args.use_scenario_api:
-        if args.map_root is None:
-            raise ValueError("--use-scenario-api requires --map-root")
-        scenario_extractor = ScenarioAPIExtractor(args.data_root, args.map_root, map_version=args.map_version, sensor_root=args.sensor_root)
-        if not scenario_extractor.available:
-            raise ImportError(f"--use-scenario-api requested, but nuPlan devkit is unavailable: {scenario_extractor._init_error}")
-    action_gen = ActionGenerator(ActionGeneratorConfig(max_actions=args.max_actions, horizon_s=args.future_seconds, dt=args.dt))
-    evidence_builder = EvidenceBuilder(EvidenceBuilderConfig(max_units=args.max_evidence_units, radius_m=args.agent_radius_m))
-    teacher = TeacherEvaluator(dt=args.dt)
+    args_dict = vars(args)
+
+    if args.num_workers <= 1:
+        results = [process_one_db_worker((str(p), args_dict)) for p in tqdm(db_files, desc="db")]
+    else:
+        results = []
+        with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
+            futs = [ex.submit(process_one_db_worker, (str(p), args_dict)) for p in db_files]
+            for fut in tqdm(as_completed(futs), total=len(futs), desc="db"):
+                results.append(fut.result())
 
     manifest_rows = []
-    existing = sorted(out_dir.glob("sample_*.npz")) if args.skip_existing else []
-    sample_id = len(existing) if args.skip_existing else 0
     failures = 0
-    skipped_missing_map = 0
-    for db_path in tqdm(db_files, desc="db"):
-        if args.max_samples_total is not None and sample_id >= args.max_samples_total:
-            break
-        try:
-            with NuPlanSQLite(db_path) as db:
-                if args.create_sqlite_indexes:
-                    db.create_fast_indexes()
-                emitted = 0
-                for lidar_row in db.iter_lidar_pc_rows(args.sample_interval_s, args.max_samples_per_db):
-                    if args.max_samples_total is not None and sample_id >= args.max_samples_total:
-                        break
-                    try:
-                        sample = make_sample(db, lidar_row, args, map_provider, action_gen, evidence_builder, teacher, scenario_extractor)
-                        if sample is None:
-                            if args.require_map:
-                                skipped_missing_map += 1
-                            continue
-                        name = f"sample_{sample_id:09d}.npz"
-                        if args.skip_existing and (out_dir / name).exists():
-                            sample_id += 1
-                            continue
-                        save_sample(out_dir / name, sample, args.compress)
-                        meta = json.loads(str(sample["metadata_json"]))
-                        meta["file"] = name
-                        manifest_rows.append(meta)
-                        sample_id += 1
-                        emitted += 1
-                    except Exception as exc:
-                        failures += 1
-                        if not args.continue_on_error:
-                            raise
-                        if failures <= 10:
-                            print(f"[WARN] failed sample in {db_path}: {exc}")
-                tqdm.write(f"{db_path.name}: wrote {emitted} samples")
-        except Exception as exc:
-            failures += 1
-            if not args.continue_on_error:
-                traceback.print_exc()
-                raise
-            print(f"[WARN] failed db {db_path}: {exc}")
+    num_samples = 0
+
+    for r in results:
+        failures += int(r["failures"])
+        num_samples += int(r["written"])
+        manifest_rows.extend(r["manifest_rows"])
+
     with open(out_dir / "manifest.jsonl", "w", encoding="utf-8") as f:
         for row in manifest_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     write_json(out_dir / "summary.json", {
-        "num_samples": sample_id,
+        "num_samples": num_samples,
         "num_failures": failures,
         "num_dbs": len(db_files),
-        "skipped_missing_map": skipped_missing_map,
     })
-    print(f"Wrote {sample_id} samples to {out_dir}; failures={failures}; skipped_missing_map={skipped_missing_map}")
+
+def process_one_db_worker(payload: tuple[str, dict]) -> dict:
+    db_path_str, args_dict = payload
+    args = argparse.Namespace(**args_dict)
+
+    db_path = Path(db_path_str)
+    out_root = ensure_dir(args.output_dir)
+
+    # 每个 DB 写入独立子目录，避免多进程争抢 sample_id。
+    db_out = ensure_dir(out_root / db_path.stem)
+
+    map_provider = NuPlanMapProvider(
+        args.map_root,
+        args.max_map_polylines,
+        args.max_map_points,
+        map_version=args.map_version,
+    )
+    scenario_extractor = None
+    if args.use_scenario_api:
+        scenario_extractor = ScenarioAPIExtractor(
+            args.data_root,
+            args.map_root,
+            map_version=args.map_version,
+            sensor_root=args.sensor_root,
+        )
+
+    action_gen = ActionGenerator(
+        ActionGeneratorConfig(
+            max_actions=args.max_actions,
+            horizon_s=args.future_seconds,
+            dt=args.dt,
+        )
+    )
+    evidence_builder = EvidenceBuilder(
+        EvidenceBuilderConfig(
+            max_units=args.max_evidence_units,
+            radius_m=args.agent_radius_m,
+        )
+    )
+    teacher = TeacherEvaluator(dt=args.dt)
+
+    written = 0
+    failures = 0
+    manifest_rows = []
+
+    try:
+        with NuPlanSQLite(db_path) as db:
+            if args.create_sqlite_indexes:
+                db.create_fast_indexes()
+
+            for lidar_row in db.iter_lidar_pc_rows(args.sample_interval_s, args.max_samples_per_db):
+                try:
+                    sample = make_sample(
+                        db,
+                        lidar_row,
+                        args,
+                        map_provider,
+                        action_gen,
+                        evidence_builder,
+                        teacher,
+                        scenario_extractor,
+                    )
+                    if sample is None:
+                        continue
+
+                    name = f"{db_path.stem}_{written:09d}.npz"
+                    save_sample(db_out / name, sample, args.compress)
+
+                    meta = safe_json_scalar(sample["metadata_json"])
+                    meta["file"] = str(Path(db_path.stem) / name)
+                    manifest_rows.append(meta)
+                    written += 1
+
+                    if args.max_samples_total is not None and written >= args.max_samples_total:
+                        break
+
+                except Exception as exc:
+                    failures += 1
+                    if not args.continue_on_error:
+                        raise
+                    if failures <= 5:
+                        print(f"[WARN] failed sample in {db_path}: {repr(exc)}")
+
+    except Exception as exc:
+        failures += 1
+        if not args.continue_on_error:
+            raise
+        print(f"[WARN] failed db {db_path}: {repr(exc)}")
+
+    return {
+        "db_path": str(db_path),
+        "written": written,
+        "failures": failures,
+        "manifest_rows": manifest_rows,
+    }
+
+def safe_json_scalar(value: object) -> dict:
+    if isinstance(value, np.ndarray):
+        value = value.item()
+
+    if isinstance(value, (bytes, np.bytes_)):
+        value = bytes(value).decode("utf-8", errors="replace")
+
+    if isinstance(value, str):
+        return json.loads(value)
+
+    return json.loads(str(value))
 
 
 if __name__ == "__main__":
