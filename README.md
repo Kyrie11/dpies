@@ -434,3 +434,8 @@ Still recommended before large experiments:
 ```bash
 python scripts/check_npz_cache.py   --cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train   --limit 1000   --show-files 5
 ```
+
+## 12. Visualize metadata
+```bash
+  python -m dpies.tools.debug_vis_npz /data0/senzeyu2/dataset/nuplan/data/cache/processed_train --out-dir ./vis --limit 25
+```

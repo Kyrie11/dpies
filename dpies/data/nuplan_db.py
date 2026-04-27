@@ -53,13 +53,42 @@ def canonical_nuplan_map_name(value: str, db_name: str = "") -> str:
     }:
         return s
 
-    if "boston" in combined or "seaport" in combined:
+    # Boston
+    if (
+            "boston" in combined
+            or "seaport" in combined
+            or "us-ma" in combined
+            or "ma-boston" in combined
+    ):
         return "us-ma-boston"
-    if "vegas" in combined or "las_vegas" in combined or "las-vegas" in combined:
+
+    # Las Vegas
+    if (
+            "vegas" in combined
+            or "las_vegas" in combined
+            or "las-vegas" in combined
+            or "us-nv" in combined
+            or "nv-las" in combined
+    ):
         return "us-nv-las-vegas-strip"
-    if "pittsburgh" in combined or "hazelwood" in combined:
+
+    # Pittsburgh
+    if (
+            "pittsburgh" in combined
+            or "hazelwood" in combined
+            or "us-pa" in combined
+            or "pa-pittsburgh" in combined
+    ):
         return "us-pa-pittsburgh-hazelwood"
-    if "singapore" in combined or "one-north" in combined or "one_north" in combined or "onenorth" in combined or "sg" in combined:
+
+    # Singapore one-north
+    if (
+            "singapore" in combined
+            or "one-north" in combined
+            or "one_north" in combined
+            or "onenorth" in combined
+            or "sg-one" in combined
+    ):
         return "sg-one-north"
 
     return s or "unknown"
@@ -431,6 +460,7 @@ class NuPlanSQLite:
 
     def get_log_metadata(self) -> Dict[str, Any]:
         meta: Dict[str, Any] = {"db_path": str(self.db_path), "db_name": self.db_path.name}
+
         if self.has_table("log"):
             rows = self.conn.execute("SELECT * FROM log LIMIT 1").fetchall()
             if rows:
@@ -443,18 +473,30 @@ class NuPlanSQLite:
                         meta[k] = v
                     except Exception:
                         pass
-        if "map_name" not in meta:
-            name = self.db_path.name.lower()
-            if "boston" in name:
-                meta["map_name"] = "us-ma-boston"
-            elif "vegas" in name or "las" in name:
-                meta["map_name"] = "us-nv-las-vegas-strip"
-            elif "singapore" in name or "sg" in name:
-                meta["map_name"] = "sg-one-north"
-            elif "pittsburgh" in name or "pa" in name:
-                meta["map_name"] = "us-pa-pittsburgh-hazelwood"
-            else:
-                meta["map_name"] = "unknown"
-        meta["raw_map_name"] = str(meta.get("map_name", ""))
-        meta["map_name"] = canonical_nuplan_map_name(meta.get("map_name", ""), f"{self.db_path.parent.name} {self.db_path.name}")
+
+        # Build a rich context string. nuPlan DBs often expose location rather than map_name.
+        candidates = []
+        for k in (
+                "map_name",
+                "location",
+                "city",
+                "map_location",
+                "logfile",
+                "log_file",
+                "log_name",
+                "vehicle_name",
+        ):
+            v = meta.get(k, "")
+            if v is not None:
+                candidates.append(str(v))
+
+        candidates.append(str(self.db_path.parent.name))
+        candidates.append(str(self.db_path.name))
+
+        raw_context = " ".join(candidates)
+        raw_map_name = str(meta.get("map_name", "")) or str(meta.get("location", "")) or raw_context
+
+        meta["raw_map_name"] = raw_map_name
+        meta["map_name"] = canonical_nuplan_map_name(raw_map_name, raw_context)
+
         return meta
