@@ -332,9 +332,6 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
     # 每个 DB 写入独立子目录，避免多进程争抢 sample_id。
     db_name = db_output_name(db_path)
     db_out = ensure_dir(out_root / db_name)
-    name = f"{db_name}_{written:09d}.npz"
-
-
     map_provider = NuPlanMapProvider(
         args.map_root,
         args.max_map_polylines,
