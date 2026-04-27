@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Sequence
-
+import warnings
 import numpy as np
 
 from dpies.common.geometry import box_corners, pairwise_min_distance, polygon_overlap_area, time_to_collision_1d, wrap_angle
@@ -16,6 +16,43 @@ except Exception:  # pragma: no cover
     Polygon = None
     unary_union = None
 
+def _safe_distance(a: Any, b: Any, default: float = 99.0) -> float:
+    """Return a finite Shapely distance without emitting RuntimeWarning.
+
+    Some nuPlan map geometries can be empty/invalid after projection or clipping.
+    Shapely may then return nan and emit:
+        RuntimeWarning: invalid value encountered in distance
+
+    We treat those cases as far away so they do not poison geometry_query or
+    teacher labels.
+    """
+    if a is None or b is None:
+        return float(default)
+
+    try:
+        if getattr(a, "is_empty", False) or getattr(b, "is_empty", False):
+            return float(default)
+
+        if not getattr(a, "is_valid", True):
+            a = a.buffer(0)
+        if not getattr(b, "is_valid", True):
+            b = b.buffer(0)
+
+        if getattr(a, "is_empty", False) or getattr(b, "is_empty", False):
+            return float(default)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in distance",
+                category=RuntimeWarning,
+            )
+            d = float(a.distance(b))
+
+        return d if np.isfinite(d) else float(default)
+
+    except Exception:
+        return float(default)
 
 def _valid_type(type_id: int) -> EvidenceType:
     try:
@@ -208,12 +245,12 @@ def _distance_to_meta_geometry(action: np.ndarray, meta: dict[str, Any] | None, 
         d, idx, _ = pairwise_min_distance(action[:, :2], fallback_point.reshape(1, 2))
         return float(d), int(idx)
     try:
-        dist = min(float(line.distance(g)) for g in geoms)
+        dist = min(_safe_distance(line, g) for g in geoms)
         # Nearest discrete step for timing.
         step_d = []
         for st in action:
             pt = Point(float(st[0]), float(st[1]))
-            step_d.append(min(float(pt.distance(g)) for g in geoms))
+            step_d.append(min(_safe_distance(pt, g) for g in geoms))
         return dist, int(np.argmin(step_d))
     except Exception:
         d, idx, _ = pairwise_min_distance(action[:, :2], fallback_point.reshape(1, 2))
@@ -231,14 +268,14 @@ def _first_interaction_time(action: np.ndarray, meta: dict[str, Any] | None, dt:
     ego_polys = _ego_polygons(action)
     for idx, ep in enumerate(ego_polys):
         try:
-            if any(ep.intersects(g) or ep.distance(g) < 0.25 for g in geoms):
+            if any(ep.intersects(g) or _safe_distance(ep, g) < 0.25 for g in geoms):
                 return float(idx + 1) * dt
         except Exception:
             continue
     center = _action_centerline(action)
     if center is not None:
         try:
-            if any(center.intersects(g) or center.distance(g) < 0.25 for g in geoms):
+            if any(center.intersects(g) or _safe_distance(center, g) < 0.25 for g in geoms):
                 return dt
         except Exception:
             pass
@@ -295,7 +332,7 @@ def _map_rule_exact(q: np.ndarray, feature: np.ndarray, action: np.ndarray, dt: 
         elif centerline is not None:
             for pts in polylines:
                 g = _make_line(pts)
-                if g is not None and centerline.distance(g) < 2.0:
+                if g is not None and _safe_distance(centerline, g) < 2.0:
                     max_area = max(max_area, 1.0)
         q[18] = max(q[18], max_area)
     elif rule_code == int(MapRuleCode.DRIVABLE_AREA):
