@@ -235,8 +235,34 @@ class DPIESNetwork(nn.Module):
         signed = 0.5 * (raw_all - raw_all.transpose(-1, -2))
         return signed
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Backward-compatible full forward."""
-        out = self.forward_rival(batch)
-        out["signed_evidence"] = self.signed_evidence_full(batch, out)
-        return out
+    def forward(
+            self,
+            batch: Dict[str, torch.Tensor],
+            mode: str = "full",
+            pair_mask: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Forward modes.
+
+        mode='full':
+            original dense KxK signed-evidence forward.
+        mode='rival':
+            only compute encodings and rival scores.
+        mode='screened':
+            compute rival scores and screened signed evidence for provided pair_mask.
+        """
+        if mode == "rival":
+            return self.forward_rival(batch)
+
+        if mode == "full":
+            out = self.forward_rival(batch)
+            out["signed_evidence"] = self.signed_evidence_full(batch, out)
+            return out
+
+        if mode == "screened":
+            if pair_mask is None:
+                raise ValueError("mode='screened' requires pair_mask.")
+            out = self.forward_rival(batch)
+            out["signed_evidence"] = self.signed_evidence_for_pair_mask(batch, out, pair_mask)
+            return out
+
+        raise ValueError(f"Unknown forward mode: {mode}")

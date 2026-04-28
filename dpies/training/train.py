@@ -232,7 +232,7 @@ def main() -> None:
                 if two_stage_signed_evidence:
                     out = unwrap_model(model).forward_rival(batch)
                 else:
-                    out = model(batch)
+                    out = model(batch, mode="rival")
 
             out = decision_outputs_fp32(out)
 
@@ -316,24 +316,39 @@ def main() -> None:
             }
 
             history.append(row)
-            print(json.dumps(row, indent=2))
+            print(json.dumps(row, indent=2), flush=True)
 
             with open(out_dir / "metrics.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
+                f.flush()
 
-            save_checkpoint(out_dir / "last.pt", unwrap_model(model), opt, epoch, cfg, val_metrics)
+            save_checkpoint(
+                out_dir / "last.pt",
+                unwrap_model(model),
+                opt,
+                epoch,
+                cfg,
+                val_metrics,
+            )
 
             if val_metrics.get("action_match", 0.0) > best_match:
                 best_match = val_metrics.get("action_match", 0.0)
-                save_checkpoint(out_dir / "best.pt", unwrap_model(model), opt, epoch, cfg, val_metrics)
+                save_checkpoint(
+                    out_dir / "best.pt",
+                    unwrap_model(model),
+                    opt,
+                    epoch,
+                    cfg,
+                    val_metrics,
+                )
 
         if distributed:
-            dist.destroy_process_group()
+            dist.barrier()
+    if distributed:
+        dist.destroy_process_group()
 
-        if val_metrics.get("action_match", 0.0) > best_match:
-            best_match = val_metrics.get("action_match", 0.0)
-            save_checkpoint(out_dir / "best.pt", model, opt, epoch, cfg, val_metrics)
-    print(f"done. best action_match={best_match:.4f}")
+    if is_main_process(rank):
+        print(f"done. best action_match={best_match:.4f}")
 
 
 if __name__ == "__main__":
