@@ -387,7 +387,8 @@ def query_one(feature: np.ndarray, type_id: int, action: np.ndarray, dt: float =
               future_agent_mask: np.ndarray | None = None,
               metadata: dict[str, Any] | None = None,
               route_info: dict[str, Any] | None = None,
-              use_future_traffic: bool = False) -> np.ndarray:
+              use_future_traffic: bool = False,
+              exact_map_rules: bool = True) -> np.ndarray:
     q = np.zeros((QUERY_DIM,), dtype=np.float32)
     xy = action[:, :2]
     speed = action[:, 3]
@@ -469,7 +470,8 @@ def query_one(feature: np.ndarray, type_id: int, action: np.ndarray, dt: float =
             q[20] = 1.0 if np.any(side * action[:, 1] > boundary_y) else 0.0
         q[21] = max(0.0, max_speed - 13.4)
         q[22] = max(q[22], max(0.0, -float(action[-1, 0])))
-        _map_rule_exact(q, feature, action, dt, metadata, route_info, use_future_traffic=use_future_traffic)
+        if exact_map_rules:
+            _map_rule_exact(q, feature, action, dt, metadata, route_info, use_future_traffic=use_future_traffic)
     q[23] = 1.0
     return q
 
@@ -480,7 +482,8 @@ def compute_geometry_query(evidence_features: np.ndarray, evidence_type: np.ndar
                            future_agent_mask: np.ndarray | None = None,
                            evidence_metadata: Sequence[dict[str, Any]] | None = None,
                            route_info: dict[str, Any] | None = None,
-                           use_future_traffic: bool = False) -> np.ndarray:
+                           use_future_traffic: bool = False,
+                           exact_map_rules: bool = True) -> np.ndarray:
     n, k = evidence_features.shape[0], actions.shape[0]
     out = np.zeros((n, k, QUERY_DIM), dtype=np.float32)
     for i in range(n):
@@ -492,7 +495,7 @@ def compute_geometry_query(evidence_features: np.ndarray, evidence_type: np.ndar
                 continue
             out[i, a] = query_one(evidence_features[i], int(evidence_type[i]), actions[a], dt, future_agents,
                                   future_agent_mask, metadata=meta, route_info=route_info,
-                                  use_future_traffic=use_future_traffic)
+                                  use_future_traffic=use_future_traffic, exact_map_rules=exact_map_rules)
     return out
 
 

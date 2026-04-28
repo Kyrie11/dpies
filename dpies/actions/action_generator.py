@@ -21,7 +21,7 @@ class ActionGeneratorConfig:
     max_curvature: float = 0.35
     lane_width_m: float = 3.5
     allow_topology_fallback_lane_changes: bool = True
-    require_route_for_merge: bool = True
+    require_route_for_merge: bool = True # deprecated: merge is now contextual metadata, not a primitive mode
     lateral_corridor_margin_m: float = 1.25
     max_terminal_progress_m: float = 180.0
     coverage_horizon_speed_multipliers: tuple[float, ...] = (0.75, 1.0, 1.25)
@@ -108,14 +108,14 @@ class ActionGenerator:
     def _lane_change_sides(self, rule_units: list[dict] | None) -> list[tuple[float, ActionMode]]:
         sides = []
         for lat, mode in (
-        (self.cfg.lane_width_m, ActionMode.LANE_CHANGE_LEFT), (-self.cfg.lane_width_m, ActionMode.LANE_CHANGE_RIGHT)):
+        (self.cfg.lane_width_m, ActionMode.LATERAL_LEFT), (-self.cfg.lane_width_m, ActionMode.LATERAL_RIGHT)):
             if self._corridor_has_map_support(rule_units, lat, want_route=False):
                 sides.append((lat, mode))
         if sides or not self.cfg.allow_topology_fallback_lane_changes:
             return sides
         # Fallback is only for smoke tests / incomplete map. Disable for final experiments.
-        return [(self.cfg.lane_width_m, ActionMode.LANE_CHANGE_LEFT),
-                (-self.cfg.lane_width_m, ActionMode.LANE_CHANGE_RIGHT)]
+        return [(self.cfg.lane_width_m, ActionMode.LATERAL_LEFT),
+                (-self.cfg.lane_width_m, ActionMode.LATERAL_RIGHT)]
 
 
     def generate(self, ego_history: np.ndarray, agent_history: np.ndarray | None = None, agent_mask: np.ndarray | None = None,
@@ -156,7 +156,7 @@ class ActionGenerator:
             for progress in base_progress:
                 traj = kinematic_rollout(current_speed, vtar, 0.0, self.cfg.horizon_s, self.cfg.dt, progress)
                 if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):
-                    mode = ActionMode.PROCEED if vtar > current_speed + 1.0 else ActionMode.KEEP
+                    mode = ActionMode.LONGITUDINAL
                     actions.append(self._make(mode, traj, vtar, 0.0, progress))
         for stop_d in self._stop_distances_from_rules(rule_units):
             traj = stop_rollout(current_speed, stop_d, self.cfg.horizon_s, self.cfg.dt)
@@ -172,16 +172,10 @@ class ActionGenerator:
                     traj = kinematic_rollout(current_speed, vtar, lat, self.cfg.horizon_s, self.cfg.dt, progress)
                     if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):
                         actions.append(self._make(mode, traj, vtar, lat, progress))
-        # Lightweight merge candidates: lateral transition toward the same adjacent-lane geometry,
-        # tagged separately so gap evidence can learn merge-specific preferences.
-        merge_lats = [lat for lat, _ in self._lane_change_sides(rule_units)]
-        if self.cfg.require_route_for_merge:
-            merge_lats = [lat for lat in merge_lats if self._corridor_has_map_support(rule_units, lat, want_route=True)]
-        for lat in merge_lats:
-            for progress in sorted(set([30.0, 45.0] + [p for p in base_progress if p >= 30.0])):
-                traj = kinematic_rollout(current_speed, max(2.0, current_speed), lat, self.cfg.horizon_s, self.cfg.dt, progress)
-                if action_feasible(traj, self.cfg.max_accel, self.cfg.min_accel, self.cfg.max_curvature):
-                    actions.append(self._make(ActionMode.MERGE, traj, max(2.0, current_speed), lat, progress))
+
+        # Merge is not a primitive action label. If the map context is a connector/route
+        # branch, the same lateral trajectories can later be interpreted as merge-like
+        # by evidence metadata; the primitive geometry remains left/right lateral.
         for lat, mode in ((1.0, ActionMode.NUDGE_LEFT), (-1.0, ActionMode.NUDGE_RIGHT)):
             for progress in (20.0, 35.0):
                 traj = kinematic_rollout(current_speed, max(2.0, current_speed), lat, self.cfg.horizon_s, self.cfg.dt, progress)

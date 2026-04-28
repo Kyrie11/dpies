@@ -2,15 +2,22 @@ from enum import IntEnum
 
 
 class ActionMode(IntEnum):
-    KEEP = 0
+    # Canonical geometric action families. Semantic maneuvers such as
+    # yield/merge/proceed are represented as metadata or interpreted from the
+    # trajectory/context, not as separate primitive action labels.
+    LONGITUDINAL = 0
     STOP = 1
-    PROCEED = 2
+    CREEP = 2
+    LATERAL_LEFT = 3
+    LATERAL_RIGHT = 4
+    NUDGE_LEFT = 5
+    NUDGE_RIGHT = 6
+    # Backward-compatible aliases for older code paths / cached configs.
+    KEEP = 0
+    PROCEED = 0
     LANE_CHANGE_LEFT = 3
     LANE_CHANGE_RIGHT = 4
-    MERGE = 5
-    NUDGE_LEFT = 6
-    NUDGE_RIGHT = 7
-    CREEP = 8
+    MERGE = 3
 
 
 class EvidenceType(IntEnum):

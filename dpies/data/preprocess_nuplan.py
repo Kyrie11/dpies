@@ -148,17 +148,18 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
+        exact_map_rules=getattr(args, "exact_input_map_query", False),
     )
     teacher_geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         future_agents=agent_future, future_agent_mask=agent_future_mask, evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
-        use_future_traffic=True,
+        use_future_traffic=True, exact_map_rules=True,
     )
     local_cost = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query, evidence_mask, action_mask)
     teacher_cost, teacher_components = teacher.evaluate_with_components(
         actions, action_mask, logged_future, agent_future, agent_mask,
         evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
-        agent_future_mask=agent_future_mask, dt=args.dt,
+        agent_future_mask=agent_future_mask, dt=args.dt, local_cost=local_cost,
     )
     oracle = oracle_action(teacher_cost, action_mask)
     rival = rival_labels(teacher_cost, action_mask, args.rival_top_rank_l, args.rival_margin_delta)
@@ -255,7 +256,7 @@ def main() -> None:
     p.add_argument("--max-agents", type=int, default=64)
     p.add_argument("--agent-radius-m", type=float, default=80.0)
     p.add_argument("--max-actions", type=int, default=32)
-    p.add_argument("--max-evidence-units", type=int, default=128)
+    p.add_argument("--max-evidence-units", type=int, default=96)
     p.add_argument("--max-map-polylines", type=int, default=256)
     p.add_argument("--max-map-points", type=int, default=20)
     p.add_argument("--map-radius-m", type=float, default=80.0)
@@ -264,6 +265,8 @@ def main() -> None:
     p.add_argument("--use-scenario-api", action="store_true", help="use official NuPlanScenario API for route, traffic-light, and map extraction")
     p.add_argument("--require-map", action="store_true", help="skip/raise when HD-map extraction fails instead of silently using empty maps")
     p.add_argument("--disable-map", action="store_true", help="force empty maps for fast dynamic-only debugging")
+    p.add_argument("--exact-input-map-query", action="store_true",
+                   help="also run exact shapely map-rule checks for model-input geometry_query; teacher labels always use exact map checks")
     p.add_argument("--rival-top-rank-l", type=int, default=8)
     p.add_argument("--rival-margin-delta", type=float, default=0.5)
     p.add_argument("--s-max", type=float, default=10.0)

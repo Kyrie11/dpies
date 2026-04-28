@@ -6,7 +6,7 @@ model:
   action_meta_dim: 8
   evidence_dim: 32
   query_dim: 24
-  num_action_modes: 9
+  num_action_modes: 7
   num_evidence_types: 6
   hidden_dim: 256
   dropout: 0.1

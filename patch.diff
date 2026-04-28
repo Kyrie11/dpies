@@ -1,0 +1,486 @@
+diff --git a/dpies/data/nuplan_db.py b/dpies/data/nuplan_db.py
+index 1afbc96..102890c 100644
+--- a/dpies/data/nuplan_db.py
++++ b/dpies/data/nuplan_db.py
+@@ -110,6 +110,8 @@ class NuPlanSQLite:
+         self._lidar_rows: Optional[List[sqlite3.Row]] = None
+         self._lidar_times: Optional[np.ndarray] = None
+         self._box_cache: Dict[str, List[Dict[str, Any]]] = {}
++        self._traffic_light_cache: Dict[str, List[Dict[str, Any]]] = {}
++        self._route_cache: Dict[str, List[str]] = {}
+         self._box_cols_cache: Optional[Dict[str, str]] = None
+ 
+     def close(self) -> None:
+@@ -385,12 +387,14 @@ class NuPlanSQLite:
+     def route_roadblock_ids_for_lidar_token(self, lidar_token: Any) -> List[str]:
+         """Return v1.1 route roadblock ids using the official devkit query when available."""
+         token = token_to_str(lidar_token)
++        if token in self._route_cache:
++            return list(self._route_cache[token])
+         try:
+             from nuplan.database.nuplan_db.nuplan_scenario_queries import get_roadblock_ids_for_lidarpc_token_from_db  # type: ignore
+             ids = get_roadblock_ids_for_lidarpc_token_from_db(str(self.db_path), token)
+-            if ids is None:
+-                return []
+-            return [str(x) for x in ids]
++            out = [] if ids is None else [str(x) for x in ids]
++            self._route_cache[token] = out
++            return list(out)
+         except Exception:
+             pass
+         for table in ("lidar_pc", "scene", "scenario"):
+@@ -407,9 +411,12 @@ class NuPlanSQLite:
+                     raw = row["route"]
+                     if isinstance(raw, bytes):
+                         raw = raw.decode("utf-8", errors="ignore")
+-                    return [x.strip() for x in str(raw).replace(";", ",").split(",") if x.strip()]
++                    out = [x.strip() for x in str(raw).replace(";", ",").split(",") if x.strip()]
++                    self._route_cache[token] = out
++                    return list(out)
+             except Exception:
+                 continue
++        self._route_cache[token] = []
+         return []
+ 
+     @staticmethod
+@@ -438,20 +445,27 @@ class NuPlanSQLite:
+         }
+ 
+     def traffic_light_statuses_for_lidar_token(self, lidar_token: Any) -> List[Dict[str, Any]]:
+-        """Return current traffic light status records via the official nuPlan query."""
++        """Return current traffic light status records via the official nuPlan query.
++
++        Results are cached per DB worker.  A shallow copy is returned so callers
++        can add fields such as relative_time_s without mutating the cache.
++        """
+         token = token_to_str(lidar_token)
++        if token in self._traffic_light_cache:
++            return [dict(r) for r in self._traffic_light_cache[token]]
+         try:
+             from nuplan.database.nuplan_db.nuplan_scenario_queries import get_traffic_light_status_for_lidarpc_token_from_db  # type: ignore
+-            return [self._traffic_light_to_dict(x) for x in get_traffic_light_status_for_lidarpc_token_from_db(str(self.db_path), token)]
++            records = [self._traffic_light_to_dict(x) for x in get_traffic_light_status_for_lidarpc_token_from_db(str(self.db_path), token)]
+         except Exception:
+-            return []
++            records = []
++        self._traffic_light_cache[token] = [dict(r) for r in records]
++        return [dict(r) for r in records]
+ 
+     def future_traffic_light_status_history(self, center_us: int, future_s: float, dt: float) -> List[List[Dict[str, Any]]]:
+         offsets = np.arange(dt, future_s + 1e-6, dt, dtype=np.float32)
+         out: List[List[Dict[str, Any]]] = []
+         for off in offsets:
+             row = self.nearest_lidar_row(int(center_us + float(off) * 1e6))
+-            
+             records = self.traffic_light_statuses_for_lidar_token(row["token"]) if row is not None else []
+             for rec in records:
+                 rec["relative_time_s"] = float(off)
+diff --git a/dpies/data/preprocess_nuplan.py b/dpies/data/preprocess_nuplan.py
+index eee39d9..a5099c0 100644
+--- a/dpies/data/preprocess_nuplan.py
++++ b/dpies/data/preprocess_nuplan.py
+@@ -155,10 +155,10 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
+         use_future_traffic=True,
+     )
+     local_cost = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query, evidence_mask, action_mask)
+-    teacher_cost, teacher_components = teacher.evaluate_with_components(
++    teacher_cost, teacher_components, teacher_base_cost, teacher_evidence_cost = teacher.evaluate_with_components(
+         actions, action_mask, logged_future, agent_future, agent_mask,
+         evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
+-        agent_future_mask=agent_future_mask, dt=args.dt,
++        agent_future_mask=agent_future_mask, dt=args.dt, local_cost=local_cost,
+     )
+     oracle = oracle_action(teacher_cost, action_mask)
+     rival = rival_labels(teacher_cost, action_mask, args.rival_top_rank_l, args.rival_margin_delta)
+@@ -187,6 +187,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
+         "evidence_count": int(evidence_mask.sum()),
+         "dt": float(args.dt),
+         "ego_dim": int(ego_history.shape[-1]),
++        "teacher_component_names": list(getattr(teacher, "COMPONENT_NAMES", ())),
+     }
+     sample = {
+         "ego_history": ego_history.astype(np.float32),
+@@ -211,6 +212,8 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
+         "geometry_query": geometry_query.astype(np.float32),
+         "teacher_cost": teacher_cost.astype(np.float32),
+         "teacher_components": teacher_components.astype(np.float32),
++        "teacher_base_cost": teacher_base_cost.astype(np.float32),
++        "teacher_evidence_cost": teacher_evidence_cost.astype(np.float32),
+         "local_cost_sum": local_sum,
+         "oracle_action_index": np.asarray(oracle, dtype=np.int64),
+         "rival_label": rival.astype(bool),
+@@ -281,6 +284,8 @@ def main() -> None:
+     p.add_argument("--num-workers", type=int, default=1)
+     p.add_argument("--slim-cache", action="store_true",
+                    help="omit large debug JSON fields after labels/query have been computed")
++    p.add_argument("--prewarm-boxes", action="store_true",
++                   help="preload lidar_box rows used by sampled history/future windows inside each DB worker")
+     args = p.parse_args()
+ 
+     out_dir = ensure_dir(args.output_dir)
+@@ -322,6 +327,28 @@ def db_output_name(db_path: Path) -> str:
+     h = hashlib.sha1(str(db_path.resolve()).encode("utf-8")).hexdigest()[:8]
+     return f"{db_path.stem}_{h}"
+ 
++def sample_output_name(db_path: Path, lidar_token: object) -> str:
++    """Deterministic filename so --skip-existing can skip before expensive work."""
++    tok = token_to_str(lidar_token)
++    if not tok:
++        tok = hashlib.sha1(str(lidar_token).encode("utf-8")).hexdigest()
++    if len(tok) > 32:
++        tok = tok[:32]
++    return f"{db_path.stem}_{tok}.npz"
++
++
++def prewarm_boxes_for_sampled_rows(db: NuPlanSQLite, sample_interval_s: float, max_samples_per_db: int | None,
++                                   history_s: float, future_s: float, dt: float) -> None:
++    """Best-effort DB-local box cache warmup for repeated history/future queries."""
++    offsets = np.arange(-history_s, future_s + 1e-6, dt, dtype=np.float32)
++    for lidar_row in db.iter_lidar_pc_rows(sample_interval_s, max_samples_per_db):
++        center_us = int(lidar_row["timestamp_us"])
++        for off in offsets:
++            row = db.nearest_lidar_row(int(center_us + float(off) * 1e6))
++            if row is not None:
++                db.boxes_at_lidar_token(row["token"])
++
++
+ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
+     db_path_str, args_dict = payload
+     args = argparse.Namespace(**args_dict)
+@@ -370,9 +397,20 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
+         with NuPlanSQLite(db_path) as db:
+             if args.create_sqlite_indexes:
+                 db.create_fast_indexes()
++            if getattr(args, "prewarm_boxes", False):
++                prewarm_boxes_for_sampled_rows(
++                    db, args.sample_interval_s, args.max_samples_per_db,
++                    args.history_seconds, args.future_seconds, args.dt,
++                )
+ 
+             for lidar_row in db.iter_lidar_pc_rows(args.sample_interval_s, args.max_samples_per_db):
+                 try:
++                    name = sample_output_name(db_path, lidar_row["token"])
++                    out_path = db_out / name
++                    if args.skip_existing and out_path.exists():
++                        written += 1
++                        continue
++
+                     sample = make_sample(
+                         db,
+                         lidar_row,
+@@ -386,22 +424,15 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
+                     if sample is None:
+                         continue
+ 
+-                    name = f"{db_path.stem}_{written:09d}.npz"
+-
+-                    out_path = db_out / name
+-                    if args.skip_existing and out_path.exists():
+-                        written += 1
+-                        continue
+-
+                     save_sample(out_path, sample, args.compress)
+ 
+                     meta = safe_json_scalar(sample["metadata_json"])
+-                    meta["file"] = str(Path(db_path.stem) / name)
++                    meta["file"] = str(Path(db_name) / name)
+                     manifest_rows.append(meta)
+                     written += 1
+ 
+-                    # if args.max_samples_total is not None and written >= args.max_samples_total:
+-                    #     break
++                    if args.max_samples_total is not None and written >= args.max_samples_total:
++                        break
+ 
+                 except Exception as exc:
+                     failures += 1
+diff --git a/dpies/teacher/labels.py b/dpies/teacher/labels.py
+index bdc8658..2178314 100644
+--- a/dpies/teacher/labels.py
++++ b/dpies/teacher/labels.py
+@@ -24,7 +24,7 @@ def normalize_costs(costs: np.ndarray, action_mask: np.ndarray, eps: float = 1e-
+ 
+ 
+ def rival_labels(costs: np.ndarray, action_mask: np.ndarray, top_rank_l: int = 8, margin_delta: float = 0.5) -> np.ndarray:
+-    """Return directed rival labels. top_rank_l means the best L actions using zero-based ranks rank < L."""
++    """Return symmetric directed rival labels for near-boundary competitive pairs."""
+     k = len(costs)
+     labels = np.zeros((k, k), dtype=bool)
+     valid_idx = np.where(action_mask)[0]
+@@ -46,31 +46,32 @@ def rival_labels(costs: np.ndarray, action_mask: np.ndarray, top_rank_l: int = 8
+ 
+ 
+ def signed_evidence_labels(local_cost: np.ndarray, action_mask: np.ndarray, s_max: float = 10.0) -> np.ndarray:
+-    # s_i(a,b)=g_i(b)-g_i(a), positive favors a over b.
++    """s_i(a,b)=g_i(b)-g_i(a), positive favors action a over b."""
++    # local_cost shape [N,K].  Axis 1 below is a, axis 2 is b.
+     s = local_cost[:, None, :] - local_cost[:, :, None]
+-    # Current shape [N,K,K] has g(b)-g(a) because axis 1=a, axis2=b.
+     valid = action_mask[None, :, None] & action_mask[None, None, :]
++    eye = np.eye(action_mask.shape[0], dtype=bool)[None, :, :]
+     s = np.clip(s, -s_max, s_max).astype(np.float32)
+-    s *= valid.astype(np.float32)
++    s *= (valid & (~eye)).astype(np.float32)
+     return s
+ 
+ 
+ def signed_evidence_active_mask(local_cost: np.ndarray, geometry_query: np.ndarray, action_mask: np.ndarray,
+                                 evidence_mask: np.ndarray, cost_threshold: float = 0.05,
+                                 query_threshold: float = 0.1) -> np.ndarray:
++    """Vectorized active mask for evidence-pair supervision.
++
++    A label is active if either action in the pair has nontrivial local cost or
++    nontrivial query activation for the evidence unit.  This is semantically
++    equivalent to the old triple loop but avoids Python O(N*K*K) loops.
++    """
+     n, k = local_cost.shape
+-    active = np.zeros((n, k, k), dtype=bool)
++    if k == 0 or n == 0:
++        return np.zeros((n, k, k), dtype=bool)
+     q_score = query_active_score(geometry_query)
+-    for i in range(n):
+-        if not evidence_mask[i]:
+-            continue
+-        for a in range(k):
+-            if not action_mask[a]:
+-                continue
+-            for b in range(k):
+-                if a == b or not action_mask[b]:
+-                    continue
+-                cost_active = max(float(local_cost[i, a]), float(local_cost[i, b])) > cost_threshold
+-                query_active = max(float(q_score[i, a]), float(q_score[i, b])) > query_threshold
+-                active[i, a, b] = cost_active or query_active
+-    return active
++    cost_active = (local_cost[:, :, None] > cost_threshold) | (local_cost[:, None, :] > cost_threshold)
++    query_active = (q_score[:, :, None] > query_threshold) | (q_score[:, None, :] > query_threshold)
++    pair_valid = action_mask[None, :, None] & action_mask[None, None, :]
++    e_valid = evidence_mask[:, None, None]
++    eye = np.eye(k, dtype=bool)[None, :, :]
++    return (cost_active | query_active) & pair_valid & e_valid & (~eye)
+diff --git a/dpies/teacher/teacher_evaluator.py b/dpies/teacher/teacher_evaluator.py
+index e59a518..9243ab1 100644
+--- a/dpies/teacher/teacher_evaluator.py
++++ b/dpies/teacher/teacher_evaluator.py
+@@ -9,14 +9,21 @@ from dpies.teacher.local_costs import LocalCostWeights, local_teacher_contributi
+ 
+ @dataclass
+ class TeacherWeights:
+-    collision: float = 100.0
+-    overlap_area: float = 50.0
+-    ttc: float = 20.0
++    """Weights for the privileged offline teacher.
++
++    The teacher is used only to create offline labels.  We intentionally split
++    the action cost into a base term and an evidence term.  The signed evidence
++    labels supervise only the decomposable evidence term, while the oracle action
++    and rival labels use the full cost.
++    """
++
++    # Global safety penalties.  Keep these moderate because local evidence also
++    # includes dynamic-agent collision/proximity costs.
++    collision: float = 30.0
++    ttc: float = 5.0
++
++    # Base action quality.
+     drivable: float = 50.0
+-    lane_boundary: float = 20.0
+-    traffic_light: float = 50.0
+-    stop_line: float = 30.0
+-    crosswalk: float = 30.0
+     route_progress: float = -5.0
+     speed_limit: float = 5.0
+     comfort_accel: float = 1.0
+@@ -25,8 +32,50 @@ class TeacherWeights:
+     imitation_ade: float = 1.0
+     imitation_fde: float = 1.0
+ 
++    # Kept for backward-compatible config loading; map-rule details are handled
++    # in LocalCostWeights/local_teacher_contribution.
++    overlap_area: float = 50.0
++    lane_boundary: float = 20.0
++    traffic_light: float = 50.0
++    stop_line: float = 30.0
++    crosswalk: float = 30.0
++
+ 
+ class TeacherEvaluator:
++    """Privileged log-replay teacher for candidate actions.
++
++    Full oracle cost:
++        J_T(a) = J_base(a) + J_evidence(a)
++
++    J_base contains imitation, progress, comfort, coarse drivable, and global
++    future-agent safety terms.  J_evidence is the sum of local atom-wise costs
++    and is the only term decomposed into signed evidence labels.  This keeps the
++    code aligned with the paper: the teacher supervises oracle/rival labels, and
++    the evidence head learns a scalable local pairwise surrogate rather than an
++    exact remove-one counterfactual over the full teacher.
++    """
++
++    # components columns:
++    # 0 imitation_ade, 1 imitation_fde, 2 progress_norm, 3 speed_over,
++    # 4 accel, 5 jerk, 6 curvature, 7 drivable, 8 collision, 9 proximity,
++    # 10 evidence_sum, 11 base_cost, 12 evidence_cost, 13 total_cost
++    COMPONENT_NAMES = (
++        "imitation_ade",
++        "imitation_fde",
++        "progress_norm",
++        "speed_over",
++        "accel",
++        "jerk",
++        "curvature",
++        "drivable",
++        "collision",
++        "proximity",
++        "evidence_sum",
++        "base_cost",
++        "evidence_cost",
++        "total_cost",
++    )
++
+     def __init__(self, weights: TeacherWeights | None = None, local_weights: LocalCostWeights | None = None, dt: float = 0.5):
+         self.weights = weights or TeacherWeights()
+         self.local_weights = local_weights or LocalCostWeights()
+@@ -35,25 +84,40 @@ class TeacherEvaluator:
+     def evaluate(self, actions: np.ndarray, action_mask: np.ndarray, logged_ego_future: np.ndarray,
+                  agent_future: np.ndarray, agent_mask: np.ndarray, evidence_features: np.ndarray,
+                  evidence_type: np.ndarray, evidence_mask: np.ndarray, teacher_geometry_query: np.ndarray,
+-                 agent_future_mask: np.ndarray | None = None, dt: float | None = None) -> np.ndarray:
+-        costs, _ = self.evaluate_with_components(actions, action_mask, logged_ego_future, agent_future, agent_mask,
+-                                                  evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
+-                                                  agent_future_mask=agent_future_mask, dt=dt)
++                 agent_future_mask: np.ndarray | None = None, dt: float | None = None,
++                 local_cost: np.ndarray | None = None) -> np.ndarray:
++        costs, _, _, _ = self.evaluate_with_components(
++            actions, action_mask, logged_ego_future, agent_future, agent_mask,
++            evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
++            agent_future_mask=agent_future_mask, dt=dt, local_cost=local_cost,
++        )
+         return costs
+ 
+     def evaluate_with_components(self, actions: np.ndarray, action_mask: np.ndarray, logged_ego_future: np.ndarray,
+                                  agent_future: np.ndarray, agent_mask: np.ndarray, evidence_features: np.ndarray,
+                                  evidence_type: np.ndarray, evidence_mask: np.ndarray, teacher_geometry_query: np.ndarray,
+-                                 agent_future_mask: np.ndarray | None = None, dt: float | None = None) -> tuple[np.ndarray, np.ndarray]:
++                                 agent_future_mask: np.ndarray | None = None, dt: float | None = None,
++                                 local_cost: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+         dt = float(self.dt if dt is None else dt)
+         k = actions.shape[0]
+         costs = np.full((k,), 1e6, dtype=np.float32)
+-        # columns: imitation_ade, imitation_fde, progress_reward, speed, accel, jerk,
+-        # curvature, drivable, collision, proximity, local_sum, total
+-        components = np.zeros((k, 12), dtype=np.float32)
+-        local = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query,
+-                                           evidence_mask, action_mask, self.local_weights)
+-        local_sum = local.sum(axis=0)
++        base_costs = np.full((k,), 1e6, dtype=np.float32)
++        evidence_costs = np.zeros((k,), dtype=np.float32)
++        components = np.zeros((k, len(self.COMPONENT_NAMES)), dtype=np.float32)
++
++        if local_cost is None:
++            local = local_teacher_contribution(
++                evidence_features,
++                evidence_type,
++                teacher_geometry_query,
++                evidence_mask,
++                action_mask,
++                self.local_weights,
++            )
++        else:
++            local = np.asarray(local_cost, dtype=np.float32)
++        local_sum = local.sum(axis=0).astype(np.float32)
++
+         for a in range(k):
+             if not action_mask[a]:
+                 continue
+@@ -70,6 +134,7 @@ class TeacherEvaluator:
+             jerk_cost = float(np.mean(np.maximum(np.abs(jerk) - 5.0, 0.0) ** 2))
+             curv_cost = float(np.mean(np.maximum(np.abs(traj[:, 5]) - 0.25, 0.0) ** 2))
+             drivable = float(np.maximum(np.max(np.abs(traj[:, 1])) - 5.25, 0.0))
++
+             col = 0.0
+             prox = 0.0
+             if agent_future.size > 0 and agent_mask.any():
+@@ -86,19 +151,26 @@ class TeacherEvaluator:
+                     m = float(dd[valid_fut].min())
+                     if m < 2.2:
+                         col += 1.0 + (2.2 - m)
+-                    prox += np.exp(-m / 3.0)
++                    prox += float(np.exp(-m / 3.0))
++
+             w = self.weights
+-            cost = 0.0
+-            cost += w.imitation_ade * ade + w.imitation_fde * fde
+-            cost += w.route_progress * (progress / 50.0)
+-            cost += w.speed_limit * speed_over
+-            cost += w.comfort_accel * accel_cost + w.comfort_jerk * jerk_cost + w.comfort_curvature * curv_cost
+-            cost += w.drivable * drivable
+-            cost += w.collision * col + w.ttc * prox
+-            cost += float(local_sum[a])
++            progress_norm = progress / 50.0
++            base = 0.0
++            base += w.imitation_ade * ade + w.imitation_fde * fde
++            base += w.route_progress * progress_norm
++            base += w.speed_limit * speed_over
++            base += w.comfort_accel * accel_cost + w.comfort_jerk * jerk_cost + w.comfort_curvature * curv_cost
++            base += w.drivable * drivable
++            base += w.collision * col + w.ttc * prox
++
++            evidence = float(local_sum[a])
++            total = float(base + evidence)
++            base_costs[a] = float(base)
++            evidence_costs[a] = evidence
++            costs[a] = total
+             components[a] = np.asarray([
+-                ade, fde, progress / 50.0, speed_over, accel_cost, jerk_cost,
+-                curv_cost, drivable, col, prox, float(local_sum[a]), float(cost)
++                ade, fde, progress_norm, speed_over, accel_cost, jerk_cost,
++                curv_cost, drivable, col, prox, evidence, float(base), evidence, total,
+             ], dtype=np.float32)
+-            costs[a] = float(cost)
+-        return costs, components
++
++        return costs, components, base_costs, evidence_costs
+diff --git a/dpies/tools/make_toy_cache.py b/dpies/tools/make_toy_cache.py
+index 1c5df91..e9e86be 100644
+--- a/dpies/tools/make_toy_cache.py
++++ b/dpies/tools/make_toy_cache.py
+@@ -70,9 +70,11 @@ def make_one(seed: int, max_agents: int, max_actions: int, max_evidence: int, dt
+     teacher_geometry_query = compute_geometry_query(evidence_features, evidence_type, actions, evidence_mask, action_mask, dt, future_agents=agent_future, future_agent_mask=agent_future_mask)
+     local_cost = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query, evidence_mask, action_mask)
+     teacher = TeacherEvaluator(dt=dt)
+-    teacher_cost, teacher_components = teacher.evaluate_with_components(actions, action_mask, logged_ego_future, agent_future, agent_mask,
+-                                                                        evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
+-                                                                        agent_future_mask=agent_future_mask, dt=dt)
++    teacher_cost, teacher_components, teacher_base_cost, teacher_evidence_cost = teacher.evaluate_with_components(
++        actions, action_mask, logged_ego_future, agent_future, agent_mask,
++        evidence_features, evidence_type, evidence_mask, teacher_geometry_query,
++        agent_future_mask=agent_future_mask, dt=dt, local_cost=local_cost,
++    )
+     oracle = oracle_action(teacher_cost, action_mask)
+     rival = rival_labels(teacher_cost, action_mask)
+     signed = signed_evidence_labels(local_cost, action_mask)
+@@ -104,6 +106,8 @@ def make_one(seed: int, max_agents: int, max_actions: int, max_evidence: int, dt
+         "geometry_query": geometry_query,
+         "teacher_cost": teacher_cost,
+         "teacher_components": teacher_components,
++        "teacher_base_cost": teacher_base_cost,
++        "teacher_evidence_cost": teacher_evidence_cost,
+         "local_cost_sum": local_cost.sum(axis=0).astype(np.float32),
+         "oracle_action_index": np.asarray(oracle, dtype=np.int64),
+         "rival_label": rival,
+diff --git a/dpies/training/dataset.py b/dpies/training/dataset.py
+index 1f060dc..df33c1b 100644
+--- a/dpies/training/dataset.py
++++ b/dpies/training/dataset.py
+@@ -15,7 +15,7 @@ FLOAT_KEYS = {
+     "ego_history", "ego_global_state", "ego_to_global",
+     "agent_history", "agent_future", "map_polylines", "actions", "action_meta",
+     "evidence_features", "evidence_cost", "geometry_query", "teacher_cost", "teacher_components",
+-    "local_cost_sum", "signed_evidence_label", "logged_ego_future",
++    "teacher_base_cost", "teacher_evidence_cost", "local_cost_sum", "signed_evidence_label", "logged_ego_future",
+ }
+ BOOL_KEYS = {
+     "agent_mask", "agent_history_mask", "agent_future_mask", "map_masks", "action_mask",
+
+

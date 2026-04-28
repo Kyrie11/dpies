@@ -36,12 +36,15 @@ def _jsonable_polygons(value: Any) -> list[list[list[float]]]:
 
 @dataclass
 class EvidenceBuilderConfig:
-    max_units: int = 128
-    max_dynamic: int = 48
-    max_conflict: int = 32
-    max_gap: int = 16
-    max_map_rule: int = 32
-    max_risk: int = 16
+    # Event-level evidence should be sparse. Generic dynamic-agent objects are
+    # capped aggressively because they are expensive to query against every
+    # action and are often redundant with conflict/risk events.
+    max_units: int = 96
+    max_dynamic: int = 12
+    max_conflict: int = 24
+    max_gap: int = 8
+    max_map_rule: int = 24
+    max_risk: int = 4
     radius_m: float = 80.0
     conflict_distance_m: float = 5.0
     low_ttc_s: float = 3.0
@@ -93,6 +96,9 @@ class EvidenceBuilder:
         """
         units: List[tuple[float, bool, EvidenceType, np.ndarray, dict[str, Any]]] = []
         valid_agents = np.where(agent_mask)[0]
+        time_steps = np.arange(1, actions.shape[1] + 1, dtype=np.float32) * dt
+        action_union = actions[action_mask, :, :2].reshape(-1, 2) if action_mask.any() else np.zeros((0, 2),
+                                                                                                     dtype=np.float32)
 
         dyn_count = 0
         for idx in valid_agents:
@@ -105,17 +111,26 @@ class EvidenceBuilder:
             heading_align = 1.0 if speed < 0.2 else float(max(np.cos(float(yaw) - np.arctan2(vy, vx)), 0.0))
             conf = float(np.clip(0.35 + 0.35 * np.exp(-dist / 40.0) + 0.3 * heading_align, 0.1, 1.0))
             ttc = time_to_collision_1d(np.asarray([x, y], dtype=np.float32), np.asarray([vx, vy], dtype=np.float32), radius=4.0)
+            # Keep only dynamic agents that are likely to become event-level
+            # evidence. Distant/background objects should be encoded by the
+            # normal scene encoder, not selected as decision evidence.
+            action_near = False
+            if len(action_union):
+                dmin_action, _, _ = pairwise_min_distance(action_union, np.asarray([[x, y]], dtype=np.float32))
+                action_near = dmin_action < 10.0
+            is_event_like = (dist < 35.0) or (ttc < 5.0) or action_near or (-10.0 < x < 60.0 and abs(y) < 8.0)
+            if not is_event_like:
+                continue
+
             feat = self._feature(EvidenceType.DYNAMIC_AGENT, x, y, vx, vy, length, width, dist, ttc, conf, int(idx), aux=[0.0, yaw, obj_type])
-            meta = {"type": "dynamic_agent", "agent_ids": [int(idx)], "motion_mode": "constant_velocity", "time_interval": [0.0, float(actions.shape[1] * dt)]}
+            meta = {"type": "dynamic_object_context", "agent_ids": [int(idx)], "motion_mode": "constant_velocity", "time_interval": [0.0, float(actions.shape[1] * dt)]}
             units.append((self._relevance(feat, EvidenceType.DYNAMIC_AGENT), False, EvidenceType.DYNAMIC_AGENT, feat, meta))
             dyn_count += 1
             if dyn_count >= self.cfg.max_dynamic:
                 break
 
-        # Conflict-point evidence from ego candidates and predicted CV agents.
+        # Conflict-event evidence from ego candidates and predicted CV agents.
         conf_count = 0
-        time_steps = np.arange(1, actions.shape[1] + 1, dtype=np.float32) * dt
-        action_union = actions[action_mask, :, :2].reshape(-1, 2) if action_mask.any() else np.zeros((0, 2), dtype=np.float32)
         for idx in valid_agents:
             if conf_count >= self.cfg.max_conflict:
                 break
@@ -131,7 +146,7 @@ class EvidenceBuilder:
                 aux = [float(ego_i), float(ag_i), float(dmin), yaw, obj_type]
                 feat = self._feature(EvidenceType.CONFLICT_POINT, float(p[0]), float(p[1]), vx, vy, length, width,
                                      float(np.hypot(p[0], p[1])), float(ag_i) * dt, 1.0, int(idx), aux)
-                meta = {"type": "conflict_point", "agent_ids": [int(idx)], "time_interval": [max(0.0, (ag_i - 1) * dt), float((ag_i + 1) * dt)], "min_distance": float(dmin)}
+                meta = {"type": "conflict_event", "agent_ids": [int(idx)], "time_interval": [max(0.0, (ag_i - 1) * dt), float((ag_i + 1) * dt)], "min_distance": float(dmin), "event": "candidate_agent_conflict"}
                 units.append((self._relevance(feat, EvidenceType.CONFLICT_POINT, hard_keep=True), True, EvidenceType.CONFLICT_POINT, feat, meta))
                 conf_count += 1
 
@@ -173,7 +188,9 @@ class EvidenceBuilder:
             agent_id = int(front[1] if front else rear[1] if rear else -1)
             feat = self._feature(EvidenceType.GAP, x, lane_y, 0.0, 0.0, 0.0, self.cfg.lane_width_m,
                                  min(front_gap, rear_gap), 99.0, 1.0, agent_id, aux)
-            meta = {"type": "gap", "agent_ids": [agent_id] if agent_id >= 0 else [], "side": float(side), "front_gap": front_gap, "rear_gap": rear_gap}
+            mmeta = {"type": "target_lane_gap_event", "agent_ids": [agent_id] if agent_id >= 0 else [], "side": float(side), "front_gap": front_gap, "rear_gap": rear_gap, "front_relative_speed": front_relv,
+                     "rear_relative_speed": rear_relv,
+                     "applicable_action": "lateral_left" if side > 0 else "lateral_right"}
             units.append((self._relevance(feat, EvidenceType.GAP), False, EvidenceType.GAP, feat, meta))
             gap_count += 1
             if gap_count >= self.cfg.max_gap:
@@ -289,7 +306,7 @@ class EvidenceBuilder:
                 candidate_risk = dmin < 6.0
             if dist < 12.0 or ttc < self.cfg.low_ttc_s or candidate_risk:
                 feat = self._feature(EvidenceType.LOW_TTC_RISK, x, y, vx, vy, length, width, dist, ttc, 1.0, int(idx), aux=[yaw, obj_type])
-                meta = {"type": "low_ttc_risk", "agent_ids": [int(idx)], "ttc": float(min(ttc, 99.0)), "distance": dist}
+                meta = {"type": "low_ttc_risk_event", "agent_ids": [int(idx)], "ttc": float(min(ttc, 99.0)), "distance": dist, "event": "near_future_interaction"}
                 units.append((self._relevance(feat, EvidenceType.LOW_TTC_RISK, hard_keep=True), True, EvidenceType.LOW_TTC_RISK, feat, meta))
                 risk_count += 1
                 if risk_count >= self.cfg.max_risk:
