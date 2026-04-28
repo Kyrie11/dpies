@@ -28,7 +28,15 @@ def decision_outputs_fp32(out: dict) -> dict:
     return out
 
 @torch.no_grad()
-def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, selection_cfg: dict, max_batches=None) -> Dict[str, float]:
+def validate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    selection_cfg: dict,
+    max_batches=None,
+    use_amp: bool = False,
+    two_stage_signed_evidence: bool = True,
+) -> Dict[str, float]:
     model.eval()
     sums = defaultdict(float)
     count = 0
@@ -36,9 +44,21 @@ def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, s
         if max_batches is not None and  step>=int(max_batches):
             break
         batch = to_device(batch, device)
-        out = model(batch)
+
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
+            if two_stage_signed_evidence:
+                out = model.forward_rival(batch)
+            else:
+                out = model(batch)
+
         out = decision_outputs_fp32(out)
         pair_mask = make_directed_pair_mask(out["rival_scores"], batch["action_mask"], int(selection_cfg.get("top_m", 4)))
+
+        if two_stage_signed_evidence:
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
+                signed = model.signed_evidence_for_pair_mask(batch, out, pair_mask)
+            out["signed_evidence"] = signed.float()
+
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              batch["evidence_mask"], batch["evidence_cost"],
                                              float(selection_cfg.get("budget", 32)),
@@ -49,7 +69,16 @@ def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, s
         metrics["screen_recall_at_m"] = screening_recall_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["screen_precision_at_m"] = screening_precision_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["decisive_rival_miss_rate"] = decisive_rival_miss_rate(pair_mask, batch["rival_label"], batch["oracle_action_index"], batch["action_mask"])
-        metrics.update(evidence_prediction_metrics(out["signed_evidence"], batch["signed_evidence_label"], batch["signed_evidence_mask"], batch["evidence_mask"], batch["action_mask"]))
+        metrics.update(
+            evidence_prediction_metrics(
+                out["signed_evidence"],
+                batch["signed_evidence_label"],
+                batch["signed_evidence_mask"],
+                batch["evidence_mask"],
+                batch["action_mask"],
+                pair_mask=pair_mask if two_stage_signed_evidence else None,
+            )
+        )
         metrics["selected_count"] = float(selected.float().sum(dim=1).mean().item())
         bs = int(batch["actions"].shape[0])
         for key, val in metrics.items():

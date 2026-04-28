@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 try:
     from tqdm import tqdm
 except Exception:
@@ -40,6 +43,48 @@ def decision_outputs_fp32(out: dict) -> dict:
         out["signed_evidence"] = out["signed_evidence"].float()
     return out
 
+def init_distributed() -> tuple[bool, int, int, int]:
+    """Initialize torchrun/DDP if LOCAL_RANK is present."""
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if local_rank < 0:
+        return False, 0, 0, 1
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("DDP requires CUDA in this training script.")
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    return True, local_rank, rank, world_size
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def reduce_train_logs(
+    sums: dict,
+    seen: int,
+    device: torch.device,
+    distributed: bool,
+) -> dict[str, float]:
+    if not distributed:
+        return {k: v / max(seen, 1) for k, v in sums.items()}
+
+    keys = sorted(sums.keys())
+    values = [float(seen)] + [float(sums[k]) for k in keys]
+    t = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    total_seen = max(float(t[0].item()), 1.0)
+    return {k: float(t[i + 1].item() / total_seen) for i, k in enumerate(keys)}
+
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, epoch: int,
                     cfg: dict, metrics: dict) -> None:
     ensure_dir(path.parent)
@@ -62,6 +107,7 @@ def main() -> None:
     p.add_argument("--resume", default=None)
     p.add_argument("--override", nargs="*", default=None)
     args = p.parse_args()
+    distributed, local_rank, rank, world_size = init_distributed()
 
     cfg = load_yaml(args.config)
     cfg = deep_update(cfg, parse_override_items(args.override))
@@ -70,7 +116,9 @@ def main() -> None:
     if args.val_cache_dir:
         cfg.setdefault("data", {})["val_cache_dir"] = args.val_cache_dir
     out_dir = ensure_dir(args.output_dir)
-    write_json(out_dir / "config.json", cfg)
+    if is_main_process(rank):
+        write_json(out_dir/"config.json", cfg)
+
     set_seed(int(cfg.get("training", {}).get("seed", 7)))
     if bool(cfg["training"].get("allow_tf32", True)) and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -79,13 +127,29 @@ def main() -> None:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
-    device = torch.device(args.device)
+
+    if distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
 
     train_ds = EvidenceCacheDataset(cfg["data"]["train_cache_dir"])
     val_ds = EvidenceCacheDataset(cfg["data"].get("val_cache_dir", cfg["data"]["train_cache_dir"]))
 
     num_workers = int(cfg["data"].get("num_workers", 4))
     batch_size = int(cfg["data"].get("batch_size", 4))
+
+    train_sampler = (
+        DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False,
+        )
+        if distributed
+        else None
+    )
 
     loader_common = dict(
         batch_size=batch_size,
@@ -101,44 +165,74 @@ def main() -> None:
 
     train_loader = DataLoader(
         train_ds,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         **loader_common,
     )
 
+    # Only rank 0 uses val_loader, but constructing it on all ranks is harmless.
     val_loader = DataLoader(
         val_ds,
         shuffle=False,
         **loader_common,
     )
 
-    model = DPIESNetwork(DPIESConfig(**cfg.get("model", {}))).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"].get("lr", 1e-4)),
-                            weight_decay=float(cfg["training"].get("weight_decay", 1e-4)))
+    raw_model = DPIESNetwork(DPIESConfig(**cfg.get("model", {}))).to(device)
+
+    if distributed:
+        model = DDP(
+            raw_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+    else:
+        model = raw_model
+
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg["training"].get("lr", 1e-4)),
+        weight_decay=float(cfg["training"].get("weight_decay", 1e-4)),
+    )
+
     start_epoch = 0
     best_match = -1.0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        unwrap_model(model).load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_match = float(ckpt.get("metrics", {}).get("action_match", -1.0))
     use_amp = bool(cfg["training"].get("mixed_precision", True)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     loss_cfg = cfg.get("loss", {})
     sel_cfg = cfg.get("selection", {})
     epochs = int(cfg["training"].get("epochs", 20))
     log_interval = int(cfg["training"].get("log_interval", 20))
     history = []
+
     for epoch in range(start_epoch, epochs):
+        if distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         sums = defaultdict(float)
         seen = 0
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}")
+        pbar = tqdm(train_loader, desc=f"epoch {epoch}", disable=not is_main_process(rank))
+        two_stage_signed_evidence = bool(cfg["training"].get("two_stage_signed_evidence", True))
+
+        if two_stage_signed_evidence and bool(loss_cfg.get("loss_on_all_pairs", False)):
+            raise ValueError("training.two_stage_signed_evidence=true requires loss.loss_on_all_pairs=false")
+
         for step, batch in enumerate(pbar):
             batch = to_device(batch, device)
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                out = model(batch)
+
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                if two_stage_signed_evidence:
+                    out = unwrap_model(model).forward_rival(batch)
+                else:
+                    out = model(batch)
 
             out = decision_outputs_fp32(out)
 
@@ -147,6 +241,11 @@ def main() -> None:
                 batch["action_mask"],
                 int(sel_cfg.get("top_m", 4)),
             )
+
+            if two_stage_signed_evidence:
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    signed = unwrap_model(model).signed_evidence_for_pair_mask(batch, out, pair_mask)
+                out["signed_evidence"] = signed.float()
 
             with torch.no_grad():
                 selected = capped_greedy_select_batch(
@@ -168,37 +267,69 @@ def main() -> None:
             )
 
             loss, logs = compute_total_loss(out, batch, pair_mask, q, loss_cfg)
+
             scaler.scale(loss).backward()
+
             if float(cfg["training"].get("grad_clip_norm", 0.0)) > 0:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"].get("grad_clip_norm", 5.0)))
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    float(cfg["training"].get("grad_clip_norm", 5.0)),
+                )
+
             scaler.step(opt)
             scaler.update()
+
             bs = int(batch["actions"].shape[0])
             seen += bs
             for key, val in logs.items():
                 sums[key] += float(val.item()) * bs
-            if step % max(log_interval, 1) == 0:
-                pbar.set_postfix({k: f"{v / max(seen, 1):.4f}" for k, v in sums.items() if k.startswith("loss")})
-        train_logs = {k: v / max(seen, 1) for k, v in sums.items()}
-        validate_every = int(cfg["training"].get("validate_every_epochs", 1))
 
-        if (epoch + 1) % validate_every == 0:
-            val_metrics = validate(
-                model,
-                val_loader,
-                device,
-                sel_cfg,
-                max_batches=cfg["training"].get("max_val_batches", None),
-            )
-        else:
-            val_metrics = {}
-        row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_logs.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
-        history.append(row)
-        print(json.dumps(row, indent=2))
-        with open(out_dir / "metrics.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
-        save_checkpoint(out_dir / "last.pt", model, opt, epoch, cfg, val_metrics)
+            if is_main_process(rank) and step % max(log_interval, 1) == 0:
+                pbar.set_postfix({k: f"{v / max(seen, 1):.4f}" for k, v in sums.items() if k.startswith("loss")})
+
+        train_logs = reduce_train_logs(sums, seen, device, distributed)
+
+        if distributed:
+            dist.barrier()
+
+        validate_every = int(cfg["training"].get("validate_every_epochs", 1))
+        val_metrics = {}
+
+        if is_main_process(rank):
+            if (epoch + 1) % validate_every == 0:
+                val_metrics = validate(
+                    unwrap_model(model),
+                    val_loader,
+                    device,
+                    sel_cfg,
+                    max_batches=cfg["training"].get("max_val_batches", None),
+                    use_amp=use_amp,
+                    two_stage_signed_evidence=two_stage_signed_evidence,
+                )
+
+            row = {
+                "epoch": epoch,
+                "world_size": world_size,
+                **{f"train_{k}": v for k, v in train_logs.items()},
+                **{f"val_{k}": v for k, v in val_metrics.items()},
+            }
+
+            history.append(row)
+            print(json.dumps(row, indent=2))
+
+            with open(out_dir / "metrics.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+
+            save_checkpoint(out_dir / "last.pt", unwrap_model(model), opt, epoch, cfg, val_metrics)
+
+            if val_metrics.get("action_match", 0.0) > best_match:
+                best_match = val_metrics.get("action_match", 0.0)
+                save_checkpoint(out_dir / "best.pt", unwrap_model(model), opt, epoch, cfg, val_metrics)
+
+        if distributed:
+            dist.destroy_process_group()
+
         if val_metrics.get("action_match", 0.0) > best_match:
             best_match = val_metrics.get("action_match", 0.0)
             save_checkpoint(out_dir / "best.pt", model, opt, epoch, cfg, val_metrics)

@@ -84,11 +84,19 @@ def decisive_rival_miss_rate(pair_mask: torch.Tensor, rival_label: torch.Tensor,
     return float(sum(misses) / max(len(misses), 1))
 
 
-def evidence_prediction_metrics(pred_signed: torch.Tensor, target_signed: torch.Tensor, active_mask: torch.Tensor,
-                                evidence_mask: torch.Tensor, action_mask: torch.Tensor) -> dict[str, float]:
+def evidence_prediction_metrics(
+    pred_signed: torch.Tensor,
+    target_signed: torch.Tensor,
+    active_mask: torch.Tensor,
+    evidence_mask: torch.Tensor,
+    action_mask: torch.Tensor,
+    pair_mask: torch.Tensor | None = None,
+) -> dict[str, float]:
     b, n, k, _ = pred_signed.shape
     eye = torch.eye(k, dtype=torch.bool, device=pred_signed.device)[None, None]
     valid = evidence_mask[:, :, None, None] & action_mask[:, None, :, None] & action_mask[:, None, None, :] & (~eye) & active_mask.bool()
+    if pair_mask is not None:
+        valid = valid & pair_mask[:, None, :, :].bool()
     if valid.sum() == 0:
         return {"evidence_mae": 0.0, "evidence_rmse": 0.0, "evidence_sign_accuracy": 0.0, "evidence_pos_frac": 0.0, "evidence_neg_frac": 0.0}
     diff = pred_signed[valid] - target_signed[valid]
