@@ -188,7 +188,7 @@ class EvidenceBuilder:
             agent_id = int(front[1] if front else rear[1] if rear else -1)
             feat = self._feature(EvidenceType.GAP, x, lane_y, 0.0, 0.0, 0.0, self.cfg.lane_width_m,
                                  min(front_gap, rear_gap), 99.0, 1.0, agent_id, aux)
-            mmeta = {"type": "target_lane_gap_event", "agent_ids": [agent_id] if agent_id >= 0 else [], "side": float(side), "front_gap": front_gap, "rear_gap": rear_gap, "front_relative_speed": front_relv,
+            meta = {"type": "target_lane_gap_event", "agent_ids": [agent_id] if agent_id >= 0 else [], "side": float(side), "front_gap": front_gap, "rear_gap": rear_gap, "front_relative_speed": front_relv,
                      "rear_relative_speed": rear_relv,
                      "applicable_action": "lateral_left" if side > 0 else "lateral_right"}
             units.append((self._relevance(feat, EvidenceType.GAP), False, EvidenceType.GAP, feat, meta))

@@ -103,11 +103,17 @@ def _footprint_distance_and_overlap(action: np.ndarray, agent_xy: np.ndarray, ag
         if signed < best_signed:
             best_signed = signed
             best_i = t
-        ego_poly = box_corners(float(action[t, 0]), float(action[t, 1]), float(action[t, 2]), 4.8, 2.1)
-        ag_poly = box_corners(float(agent_xy[t, 0]), float(agent_xy[t, 1]), float(agent_yaw[t]), length, width)
-        area = polygon_overlap_area(ego_poly, ag_poly)
-        overlap_sum += area
-        overlap_max = max(overlap_max, area)
+        # Shapely polygon intersection is one of the hottest preprocessing
+        # paths. If the circle-proxy signed distance is comfortably positive,
+        # oriented rectangles cannot be overlapping in practice, so skip the
+        # expensive exact area computation.
+        if signed < 0.5:
+            ego_poly = box_corners(float(action[t, 0]), float(action[t, 1]), float(action[t, 2]), 4.8, 2.1)
+            ag_poly = box_corners(float(agent_xy[t, 0]), float(agent_xy[t, 1]), float(agent_yaw[t]),
+                                               length, width)
+            area = polygon_overlap_area(ego_poly, ag_poly)
+            overlap_sum += area
+            overlap_max = max(overlap_max, area)
     return float(best_signed), best_i, best_i, float(overlap_sum), float(overlap_max)
 
 

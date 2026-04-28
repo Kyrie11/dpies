@@ -111,6 +111,13 @@ class NuPlanSQLite:
         self._lidar_times: Optional[np.ndarray] = None
         self._box_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._box_cols_cache: Optional[Dict[str, str]] = None
+        # Per-DB caches for expensive per-sample nuPlan/devkit lookups. With
+        # sample_interval_s=1.0 and future_seconds=8.0, adjacent samples reuse
+        # most ego poses and traffic-light tokens, so caching avoids thousands of
+        # repeated SQL/devkit calls per DB.
+        self._ego_pose_cache: Dict[str, Optional[sqlite3.Row]] = {}
+        self._route_cache: Dict[str, List[str]] = {}
+        self._traffic_light_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def close(self) -> None:
         self.conn.close()
@@ -223,11 +230,17 @@ class NuPlanSQLite:
         return self._lidar_rows[idx]
 
     def ego_pose_by_token(self, token: Any) -> Optional[sqlite3.Row]:
+        key = token_to_str(token)
+        if key in self._ego_pose_cache:
+            return self._ego_pose_cache[key]
         if not self.has_table("ego_pose"):
+            self._ego_pose_cache[key] = None
             return None
         token_col = "token" if "token" in self.columns("ego_pose") else self.columns("ego_pose")[0]
         q = f"SELECT * FROM ego_pose WHERE {token_col}=? LIMIT 1"
-        return self.conn.execute(q, (token,)).fetchone()
+        row = self.conn.execute(q, (token,)).fetchone()
+        self._ego_pose_cache[key] = row
+        return row
 
     def ego_state_from_pose_row(self, row: sqlite3.Row) -> np.ndarray:
         keys = set(row.keys())
@@ -383,14 +396,19 @@ class NuPlanSQLite:
 
 
     def route_roadblock_ids_for_lidar_token(self, lidar_token: Any) -> List[str]:
-        """Return v1.1 route roadblock ids using the official devkit query when available."""
+        """Return v1.1 route roadblock ids using the official devkit query when available.
+        This is cached per lidar token. The official helper is convenient but can
+        be very expensive when called once per sample over thousands of DBs.
+        """
         token = token_to_str(lidar_token)
+        if token in self._route_cache:
+            return list(self._route_cache[token])
         try:
             from nuplan.database.nuplan_db.nuplan_scenario_queries import get_roadblock_ids_for_lidarpc_token_from_db  # type: ignore
             ids = get_roadblock_ids_for_lidarpc_token_from_db(str(self.db_path), token)
-            if ids is None:
-                return []
-            return [str(x) for x in ids]
+            out = [] if ids is None else [str(x) for x in ids]
+            self._route_cache[token] = out
+            return list(out)
         except Exception:
             pass
         for table in ("lidar_pc", "scene", "scenario"):
@@ -407,9 +425,12 @@ class NuPlanSQLite:
                     raw = row["route"]
                     if isinstance(raw, bytes):
                         raw = raw.decode("utf-8", errors="ignore")
-                    return [x.strip() for x in str(raw).replace(";", ",").split(",") if x.strip()]
+                    out = [x.strip() for x in str(raw).replace(";", ",").split(",") if x.strip()]
+                    self._route_cache[token] = out
+                    return list(out)
             except Exception:
                 continue
+        self._route_cache[token] = []
         return []
 
     @staticmethod
@@ -438,13 +459,24 @@ class NuPlanSQLite:
         }
 
     def traffic_light_statuses_for_lidar_token(self, lidar_token: Any) -> List[Dict[str, Any]]:
-        """Return current traffic light status records via the official nuPlan query."""
+        """Return current traffic light status records via the official nuPlan query.
+
+        Cached per lidar token because preprocessing may request the same future
+        token many times from neighboring samples.
+        """
+
         token = token_to_str(lidar_token)
+        if token in self._traffic_light_cache:
+            # Return shallow copies because callers add relative_time_s.
+            return [dict(x) for x in self._traffic_light_cache[token]]
         try:
             from nuplan.database.nuplan_db.nuplan_scenario_queries import get_traffic_light_status_for_lidarpc_token_from_db  # type: ignore
-            return [self._traffic_light_to_dict(x) for x in get_traffic_light_status_for_lidarpc_token_from_db(str(self.db_path), token)]
+            out = [self._traffic_light_to_dict(x) for x in
+                   get_traffic_light_status_for_lidarpc_token_from_db(str(self.db_path), token)]
         except Exception:
-            return []
+            out = []
+        self._traffic_light_cache[token] = [dict(x) for x in out]
+        return [dict(x) for x in out]
 
     def future_traffic_light_status_history(self, center_us: int, future_s: float, dt: float) -> List[List[Dict[str, Any]]]:
         offsets = np.arange(dt, future_s + 1e-6, dt, dtype=np.float32)

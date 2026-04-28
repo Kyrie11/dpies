@@ -81,7 +81,11 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     map_name = str(meta.get("map_name", "unknown"))
     route_roadblock_ids = db.route_roadblock_ids_for_lidar_token(lidar_row["token"])
     traffic_lights_current = db.traffic_light_statuses_for_lidar_token(lidar_row["token"])
-    traffic_lights_future = db.future_traffic_light_status_history(center_us, args.future_seconds, args.dt)
+    traffic_lights_future = (
+        db.future_traffic_light_status_history(center_us, args.future_seconds, args.dt)
+        if getattr(args, "use_future_traffic_labels", False)
+        else []
+    )
     scenario_ctx = None
     if scenario_extractor is not None and scenario_extractor.available:
         scenario_ctx = scenario_extractor.extract_for_lidar_row(db.db_path, lidar_row, map_name, args.future_seconds, fut_steps)
@@ -153,7 +157,8 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     teacher_geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         future_agents=agent_future, future_agent_mask=agent_future_mask, evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
-        use_future_traffic=True, exact_map_rules=True,
+        use_future_traffic=getattr(args, "use_future_traffic_labels", False),
+        exact_map_rules=getattr(args, "teacher_exact_map_query", False),
     )
     local_cost = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query, evidence_mask, action_mask)
     teacher_cost, teacher_components = teacher.evaluate_with_components(
@@ -266,7 +271,11 @@ def main() -> None:
     p.add_argument("--require-map", action="store_true", help="skip/raise when HD-map extraction fails instead of silently using empty maps")
     p.add_argument("--disable-map", action="store_true", help="force empty maps for fast dynamic-only debugging")
     p.add_argument("--exact-input-map-query", action="store_true",
-                   help="also run exact shapely map-rule checks for model-input geometry_query; teacher labels always use exact map checks")
+                   help="also run exact shapely map-rule checks for model-input geometry_query")
+    p.add_argument("--teacher-exact-map-query", action="store_true",
+                   help="run exact Shapely map-rule checks for teacher labels; slower but stricter")
+    p.add_argument("--use-future-traffic-labels", action="store_true",
+                   help="query future traffic-light history for teacher labels; slower because each sample looks up many future lidar tokens")
     p.add_argument("--rival-top-rank-l", type=int, default=8)
     p.add_argument("--rival-margin-delta", type=float, default=0.5)
     p.add_argument("--s-max", type=float, default=10.0)
@@ -374,8 +383,19 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
             if args.create_sqlite_indexes:
                 db.create_fast_indexes()
 
-            for lidar_row in db.iter_lidar_pc_rows(args.sample_interval_s, args.max_samples_per_db):
+            for lidar_idx, lidar_row in enumerate(db.iter_lidar_pc_rows(args.sample_interval_s, args.max_samples_per_db)):
                 try:
+                    # Use the sampled lidar index in the filename so --skip-existing
+                    # can avoid all expensive preprocessing before make_sample().
+                    # This makes resumed cache builds much faster. It may leave
+                    # sparse filenames when samples are filtered out, which is fine
+                    # because training uses manifest.jsonl / directory scans.
+                    name = f"{db_path.stem}_{lidar_idx:09d}.npz"
+                    out_path = db_out / name
+                    if args.skip_existing and out_path.exists():
+                        written += 1
+                        continue
+
                     sample = make_sample(
                         db,
                         lidar_row,
@@ -387,13 +407,6 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
                         scenario_extractor,
                     )
                     if sample is None:
-                        continue
-
-                    name = f"{db_path.stem}_{written:09d}.npz"
-
-                    out_path = db_out / name
-                    if args.skip_existing and out_path.exists():
-                        written += 1
                         continue
 
                     save_sample(out_path, sample, args.compress)
