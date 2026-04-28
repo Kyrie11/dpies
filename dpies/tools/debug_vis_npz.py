@@ -211,7 +211,7 @@ def visualize_one(
         if importance.shape[0] != evidence.shape[0]:
             importance = np.zeros((evidence.shape[0],), dtype=float)
 
-        fig = plt.figure(figsize=(18, 11), constained_layout=True)
+        fig = plt.figure(figsize=(18, 11), constrained_layout=True)
         gs = fig.add_gridspec(2, 3, width_ratios=[2.2, 1.0, 1.0], height_ratios=[2.0, 1.0])
         ax = fig.add_subplot(gs[:, 0])
         ax_cost = fig.add_subplot(gs[0, 1])
