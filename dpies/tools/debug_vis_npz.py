@@ -156,7 +156,7 @@ def summarize_sample(path: Path, z: np.lib.npyio.NpzFile) -> dict[str, Any]:
         "teacher_cost_min": float(np.nanmin(teacher[action_mask])) if teacher.size and action_mask.any() else None,
         "teacher_cost_max": float(np.nanmax(teacher[action_mask])) if teacher.size and action_mask.any() else None,
         "geometry_query_finite": bool(np.isfinite(q).all()) if q.size else False,
-        "geometry_query_valid_ratio": float(np.mean(q[..., 23] > 0.5)) if q.ndim == 3 and q.shape[-1] > 23 else None,
+        "geometry_query_nonpadding_ratio": float(np.mean(q[..., 23] > 0.5)) if q.ndim == 3 and q.shape[-1] > 23 else None,
         "signed_evidence_finite": bool(np.isfinite(signed).all()) if signed.size else False,
         "signed_nonzero_ratio": float(np.mean(np.abs(signed) > 1e-6)) if signed.size else None,
         "rival_positive_ratio": float(np.mean(rival)) if rival.size else None,
@@ -177,6 +177,12 @@ def visualize_one(
     max_exact_polygons: int = 20,
     max_polygon_points: int = 80,
     save_dpi: int = 120,
+    no_text: bool = False,
+    no_legend: bool = False,
+    no_tight: bool = False,
+    max_agents_draw: int = 20,
+    max_map_polylines_draw: int = 80,
+    draw_only_best_actions: int = 6,
 ):
     with np.load(path, allow_pickle=True) as z:
         meta = as_json(z["metadata_json"], {}) if "metadata_json" in z.files else {}
@@ -205,7 +211,7 @@ def visualize_one(
         if importance.shape[0] != evidence.shape[0]:
             importance = np.zeros((evidence.shape[0],), dtype=float)
 
-        fig = plt.figure(figsize=(18, 11))
+        fig = plt.figure(figsize=(18, 11), constained_layout=True)
         gs = fig.add_gridspec(2, 3, width_ratios=[2.2, 1.0, 1.0], height_ratios=[2.0, 1.0])
         ax = fig.add_subplot(gs[:, 0])
         ax_cost = fig.add_subplot(gs[0, 1])
@@ -214,7 +220,7 @@ def visualize_one(
         ax_text = fig.add_subplot(gs[1, 2])
 
         # Compact encoder map polylines.
-        for i in range(map_polys.shape[0]):
+        for i in range(min(map_polys.shape[0], max_map_polylines_draw)):
             m = map_masks[i]
             if not m.any():
                 continue
@@ -231,27 +237,83 @@ def visualize_one(
         for line in route_info.get("route_polylines", [])[:64]:
             plot_poly(ax, line, closed=False, lw=1.2, alpha=0.45, linestyle="--")
 
+        # Exact geometries from evidence metadata.
         for m in ev_meta:
             if not isinstance(m, dict) or m.get("type") != "map_rule":
                 continue
+
             layer = str(m.get("layer", ""))
             code = int(m.get("rule_code", 0))
+
+            geom_lw = 1.2
+            geom_alpha = 0.55
+            geom_ls = "-"
+
+            if layer == "DRIVABLE_AREA_UNION":
+                geom_lw = 0.8
+                geom_alpha = 0.20
+                geom_ls = "--"
+            elif layer == "ROUTE_CORRIDOR":
+                geom_lw = 1.4
+                geom_alpha = 0.45
+                geom_ls = "--"
+            elif "STOP" in layer:
+                geom_lw = 1.6
+                geom_alpha = 0.75
+            elif "CROSSWALK" in layer:
+                geom_lw = 1.2
+                geom_alpha = 0.65
 
             if skip_drivable_union and layer == "DRIVABLE_AREA_UNION":
                 xy = np.asarray(m.get("xy", []), dtype=float)
                 if xy.shape == (2,):
-                    ax.scatter([xy[0]], [xy[1]], marker=".", s=20, alpha=0.4, label="drivable union centroid")
+                    ax.scatter([xy[0]], [xy[1]], marker=".", s=20, alpha=0.4)
                 continue
 
+            # Draw single polyline.
+            line = np.asarray(m.get("polyline", []), dtype=float)
+            if line.ndim == 2 and line.shape[0] >= 2:
+                if line.shape[0] > max_polygon_points:
+                    step = max(1, int(np.ceil(line.shape[0] / max_polygon_points)))
+                    line = line[::step]
+                plot_poly(ax, line, closed=False, lw=geom_lw, alpha=geom_alpha, linestyle=geom_ls)
+
+            # Draw single polygon.
+            poly = np.asarray(m.get("polygon", []), dtype=float)
+            if poly.ndim == 2 and poly.shape[0] >= 3:
+                if poly.shape[0] > max_polygon_points:
+                    step = max(1, int(np.ceil(poly.shape[0] / max_polygon_points)))
+                    poly = poly[::step]
+                plot_poly(ax, poly, closed=True, lw=geom_lw, alpha=geom_alpha, linestyle=geom_ls)
+
+            # Draw multiple polygons.
             polygons = m.get("polygons", []) or []
             for poly in polygons[:max_exact_polygons]:
                 arr = np.asarray(poly, dtype=float)
-                if arr.ndim == 2 and arr.shape[0] > max_polygon_points:
-                    step = max(1, int(np.ceil(arr.shape[0] / max_polygon_points)))
-                    arr = arr[::step]
-                plot_poly(ax, arr, closed=True, lw=lw, alpha=alpha)
+                if arr.ndim == 2 and arr.shape[0] >= 3:
+                    if arr.shape[0] > max_polygon_points:
+                        step = max(1, int(np.ceil(arr.shape[0] / max_polygon_points)))
+                        arr = arr[::step]
+                    plot_poly(ax, arr, closed=True, lw=geom_lw, alpha=geom_alpha, linestyle=geom_ls)
+
+        valid_agents = np.where(agent_mask)[0]
+        if len(valid_agents) > max_agents_draw:
+            dists = []
+            for i in valid_agents:
+                if i >= agent_hist.shape[0]:
+                    dists.append(1e9)
+                    continue
+                valid_h = np.where(agent_hist_mask[i])[0] if i < agent_hist_mask.shape[0] else np.arange(
+                    agent_hist.shape[1])
+                if len(valid_h) == 0:
+                    dists.append(1e9)
+                    continue
+                st = agent_hist[i, valid_h[-1]]
+                dists.append(float(np.hypot(st[0], st[1])))
+            valid_agents = valid_agents[np.argsort(dists)[:max_agents_draw]]
+
         # Agents: current boxes and future tracks.
-        for i in np.where(agent_mask)[0]:
+        for i in valid_agents:
             if i >= agent_hist.shape[0]:
                 continue
             valid_h = np.where(agent_hist_mask[i])[0] if i < agent_hist_mask.shape[0] else np.arange(agent_hist.shape[1])
@@ -267,16 +329,31 @@ def visualize_one(
 
         # Actions and oracle.
         valid_actions = np.where(action_mask)[0]
-        order = valid_actions
         if teacher.size == actions.shape[0] and action_mask.any():
             order = valid_actions[np.argsort(teacher[valid_actions])]
+        else:
+            order = valid_actions
+
+        draw_set = set(order[:draw_only_best_actions].tolist())
+        if oracle >= 0:
+            draw_set.add(oracle)
+
         for k in valid_actions:
+            if draw_only_best_actions > 0 and k not in draw_set:
+                continue
             mode = int(action_meta[k, 0]) if action_meta.shape[1] else -1
             lw = 3.0 if k == oracle else (1.8 if k in order[:3] else 0.75)
             alpha = 0.95 if k == oracle else (0.75 if k in order[:3] else 0.35)
             ax.plot(actions[k, :, 0], actions[k, :, 1], linewidth=lw, alpha=alpha)
             if k == oracle or k in order[:3]:
-                ax.text(actions[k, -1, 0], actions[k, -1, 1], f"a{k}:{ACTION_MODE.get(mode, mode)}", fontsize=6)
+                if not no_text and (k == oracle or k in order[:2]):
+                    ax.text(
+                        actions[k, -1, 0],
+                        actions[k, -1, 1] + 0.8,
+                        f"a{k}",
+                        fontsize=7,
+                        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1.0),
+                    )
         if logged.size and logged.ndim == 2 and logged.shape[1] >= 2:
             ax.plot(logged[:, 0], logged[:, 1], "--", linewidth=2.2, label="logged ego future")
 
@@ -298,7 +375,19 @@ def visualize_one(
         for i in top_ids:
             if i >= len(evidence) or not e_mask[i] or importance[i] <= 0:
                 continue
-            ax.text(evidence[i, 1], evidence[i, 2], f"e{i}:{importance[i]:.1f}", fontsize=5, alpha=0.8)
+            if not no_text:
+                top_ids = np.argsort(-importance)[:top_evidence]
+                for rank, i in enumerate(top_ids):
+                    if i >= len(evidence) or not e_mask[i] or importance[i] <= 0:
+                        continue
+                    ax.text(
+                        evidence[i, 1],
+                        evidence[i, 2] + 0.5 * (rank % 3),
+                        f"e{i}",
+                        fontsize=6,
+                        alpha=0.85,
+                        bbox=dict(facecolor="white", alpha=0.65, edgecolor="none", pad=0.8),
+                    )
 
         ax.set_title(f"{path.name}\nmap={meta.get('map_name','')} success={meta.get('map_success')} oracle=a{oracle} valid_actions={int(action_mask.sum())} evidence={int(e_mask.sum())}")
         ax.set_xlim(*xlim)
@@ -311,9 +400,9 @@ def visualize_one(
         if teacher.size and action_mask.any():
             sorted_ids = valid_actions[np.argsort(teacher[valid_actions])]
             vals = teacher[sorted_ids]
-            labels = [f"a{i}\n{ACTION_MODE.get(int(action_meta[i,0]), '?')}" for i in sorted_ids]
             ax_cost.bar(np.arange(len(sorted_ids)), vals)
             ax_cost.set_xticks(np.arange(len(sorted_ids)))
+            labels = [f"a{i}" for i in sorted_ids]
             ax_cost.set_xticklabels(labels, rotation=90, fontsize=6)
             ax_cost.set_title("Teacher cost by valid action (lower is better)")
             ax_cost.grid(True, axis="y", alpha=0.25)
@@ -365,7 +454,10 @@ def visualize_one(
         fig.tight_layout()
         if out:
             out.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out, dpi=save_dpi, bbox_inches="tight")
+            if no_tight:
+                fig.savefig(out, dpi=save_dpi)
+            else:
+                fig.savefig(out, dpi=save_dpi, bbox_inches="tight")
             plt.close(fig)
         else:
             plt.show()
@@ -400,10 +492,25 @@ def main() -> None:
     p.add_argument("--max-exact-polygons", type=int, default=20)
     p.add_argument("--max-polygon-points", type=int, default=80)
     p.add_argument("--save-dpi", type=int, default=120)
+    p.add_argument("--fast", action="store_true", help="fast overview mode")
+    p.add_argument("--no-text", action="store_true", help="disable action/evidence text labels")
+    p.add_argument("--no-legend", action="store_true", help="disable legend")
+    p.add_argument("--no-tight", action="store_true", help="avoid bbox_inches='tight'")
+    p.add_argument("--max-agents-draw", type=int, default=20)
+    p.add_argument("--max-map-polylines-draw", type=int, default=80)
+    p.add_argument("--max-actions-draw", type=int, default=32)
+    p.add_argument("--draw-only-best-actions", type=int, default=6)
     args = p.parse_args()
     if args.draw_drivable_union:
         args.skip_drivable_union = False
-
+    if args.fast:
+        args.no_text = True
+        args.no_legend = True
+        args.no_tight = True
+        args.top_evidence = min(args.top_evidence, 5)
+        args.max_exact_polygons = min(args.max_exact_polygons, 5)
+        args.max_polygon_points = min(args.max_polygon_points, 30)
+        args.save_dpi = min(args.save_dpi, 80)
     samples = iter_samples(args.input, args.limit)
     if not samples:
         raise SystemExit(f"No sample_*.npz found in {args.input}")
