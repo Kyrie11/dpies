@@ -72,16 +72,45 @@ def main() -> None:
     out_dir = ensure_dir(args.output_dir)
     write_json(out_dir / "config.json", cfg)
     set_seed(int(cfg.get("training", {}).get("seed", 7)))
+    if bool(cfg["training"].get("allow_tf32", True)) and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
     device = torch.device(args.device)
 
     train_ds = EvidenceCacheDataset(cfg["data"]["train_cache_dir"])
     val_ds = EvidenceCacheDataset(cfg["data"].get("val_cache_dir", cfg["data"]["train_cache_dir"]))
-    train_loader = DataLoader(train_ds, batch_size=int(cfg["data"].get("batch_size", 4)), shuffle=True,
-                              num_workers=int(cfg["data"].get("num_workers", 4)), pin_memory=True,
-                              collate_fn=collate_samples, drop_last=False)
-    val_loader = DataLoader(val_ds, batch_size=int(cfg["data"].get("batch_size", 4)), shuffle=False,
-                            num_workers=int(cfg["data"].get("num_workers", 4)), pin_memory=True,
-                            collate_fn=collate_samples, drop_last=False)
+
+    num_workers = int(cfg["data"].get("num_workers", 4))
+    batch_size = int(cfg["data"].get("batch_size", 4))
+
+    loader_common = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=collate_samples,
+        drop_last=False,
+    )
+
+    if num_workers > 0:
+        loader_common["persistent_workers"] = True
+        loader_common["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 2))
+
+    train_loader = DataLoader(
+        train_ds,
+        shuffle=True,
+        **loader_common,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        shuffle=False,
+        **loader_common,
+    )
+
     model = DPIESNetwork(DPIESConfig(**cfg.get("model", {}))).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"].get("lr", 1e-4)),
                             weight_decay=float(cfg["training"].get("weight_decay", 1e-4)))
@@ -119,16 +148,17 @@ def main() -> None:
                 int(sel_cfg.get("top_m", 4)),
             )
 
-            selected = capped_greedy_select_batch(
-                out["signed_evidence"],
-                out["rival_scores"],
-                pair_mask,
-                batch["evidence_mask"],
-                batch["evidence_cost"],
-                float(sel_cfg.get("budget", 32)),
-                float(sel_cfg.get("eta_e", 0.05)),
-                float(sel_cfg.get("gamma0", 1.0)),
-            )
+            with torch.no_grad():
+                selected = capped_greedy_select_batch(
+                    out["signed_evidence"],
+                    out["rival_scores"],
+                    pair_mask,
+                    batch["evidence_mask"],
+                    batch["evidence_cost"],
+                    float(sel_cfg.get("budget", 32)),
+                    float(sel_cfg.get("eta_e", 0.05)),
+                    float(sel_cfg.get("gamma0", 1.0)),
+                )
 
             q, _ = compute_q_scores(
                 out["signed_evidence"],
@@ -151,7 +181,18 @@ def main() -> None:
             if step % max(log_interval, 1) == 0:
                 pbar.set_postfix({k: f"{v / max(seen, 1):.4f}" for k, v in sums.items() if k.startswith("loss")})
         train_logs = {k: v / max(seen, 1) for k, v in sums.items()}
-        val_metrics = validate(model, val_loader, device, sel_cfg)
+        validate_every = int(cfg["training"].get("validate_every_epochs", 1))
+
+        if (epoch + 1) % validate_every == 0:
+            val_metrics = validate(
+                model,
+                val_loader,
+                device,
+                sel_cfg,
+                max_batches=cfg["training"].get("max_val_batches", None),
+            )
+        else:
+            val_metrics = {}
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_logs.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(row)
         print(json.dumps(row, indent=2))

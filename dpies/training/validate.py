@@ -28,11 +28,13 @@ def decision_outputs_fp32(out: dict) -> dict:
     return out
 
 @torch.no_grad()
-def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, selection_cfg: dict) -> Dict[str, float]:
+def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, selection_cfg: dict, max_batches=None) -> Dict[str, float]:
     model.eval()
     sums = defaultdict(float)
     count = 0
-    for batch in loader:
+    for step, batch in enumerate(loader):
+        if max_batches is not None and  step>=int(max_batches):
+            break
         batch = to_device(batch, device)
         out = model(batch)
         out = decision_outputs_fp32(out)
