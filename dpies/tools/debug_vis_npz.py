@@ -156,7 +156,7 @@ def summarize_sample(path: Path, z: np.lib.npyio.NpzFile) -> dict[str, Any]:
         "teacher_cost_min": float(np.nanmin(teacher[action_mask])) if teacher.size and action_mask.any() else None,
         "teacher_cost_max": float(np.nanmax(teacher[action_mask])) if teacher.size and action_mask.any() else None,
         "geometry_query_finite": bool(np.isfinite(q).all()) if q.size else False,
-        "geometry_query_nonpadding_ratio": float(np.mean(q[..., 23] > 0.5)) if q.ndim == 3 and q.shape[-1] > 23 else None,
+        "geometry_query_valid_ratio": float(np.mean(q[..., 23] > 0.5)) if q.ndim == 3 and q.shape[-1] > 23 else None,
         "signed_evidence_finite": bool(np.isfinite(signed).all()) if signed.size else False,
         "signed_nonzero_ratio": float(np.mean(np.abs(signed) > 1e-6)) if signed.size else None,
         "rival_positive_ratio": float(np.mean(rival)) if rival.size else None,
