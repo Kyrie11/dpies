@@ -16,6 +16,16 @@ from dpies.evaluation.offline_metrics import (
 )
 from dpies.selection.capped_greedy import capped_greedy_select_batch, compute_q_scores, make_directed_pair_mask
 
+def decision_outputs_fp32(out: dict) -> dict:
+    out = dict(out)
+    if "rival_logits" in out:
+        out["rival_logits"] = out["rival_logits"].float()
+        out["rival_scores"] = torch.sigmoid(out["rival_logits"])
+    elif "rival_scores" in out:
+        out["rival_scores"] = out["rival_scores"].float()
+    if "signed_evidence" in out:
+        out["signed_evidence"] = out["signed_evidence"].float()
+    return out
 
 @torch.no_grad()
 def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, selection_cfg: dict) -> Dict[str, float]:
@@ -25,6 +35,7 @@ def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device, s
     for batch in loader:
         batch = to_device(batch, device)
         out = model(batch)
+        out = decision_outputs_fp32(out)
         pair_mask = make_directed_pair_mask(out["rival_scores"], batch["action_mask"], int(selection_cfg.get("top_m", 4)))
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              batch["evidence_mask"], batch["evidence_cost"],

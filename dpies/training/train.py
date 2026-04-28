@@ -23,6 +23,22 @@ from dpies.training.dataset import EvidenceCacheDataset
 from dpies.training.losses import compute_total_loss
 from dpies.training.validate import validate
 
+def decision_outputs_fp32(out: dict) -> dict:
+    """Cast tensors used by screening/selection/loss to fp32.
+
+    AMP is useful for the neural forward pass, but the downstream
+    discrete screening, masked top-k, q-score computation, and losses
+    should run in fp32 for numerical stability.
+    """
+    out = dict(out)
+    if "rival_logits" in out:
+        out["rival_logits"] = out["rival_logits"].float()
+        out["rival_scores"] = torch.sigmoid(out["rival_logits"])
+    elif "rival_scores" in out:
+        out["rival_scores"] = out["rival_scores"].float()
+    if "signed_evidence" in out:
+        out["signed_evidence"] = out["signed_evidence"].float()
+    return out
 
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, epoch: int,
                     cfg: dict, metrics: dict) -> None:
@@ -78,7 +94,7 @@ def main() -> None:
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_match = float(ckpt.get("metrics", {}).get("action_match", -1.0))
     use_amp = bool(cfg["training"].get("mixed_precision", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     loss_cfg = cfg.get("loss", {})
     sel_cfg = cfg.get("selection", {})
     epochs = int(cfg["training"].get("epochs", 20))
@@ -92,16 +108,36 @@ def main() -> None:
         for step, batch in enumerate(pbar):
             batch = to_device(batch, device)
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                 out = model(batch)
-                pair_mask = make_directed_pair_mask(out["rival_scores"], batch["action_mask"], int(sel_cfg.get("top_m", 4)))
-                selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
-                                                     batch["evidence_mask"], batch["evidence_cost"],
-                                                     float(sel_cfg.get("budget", 32)),
-                                                     float(sel_cfg.get("eta_e", 0.05)),
-                                                     float(sel_cfg.get("gamma0", 1.0)))
-                q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"])
-                loss, logs = compute_total_loss(out, batch, pair_mask, q, loss_cfg)
+
+            out = decision_outputs_fp32(out)
+
+            pair_mask = make_directed_pair_mask(
+                out["rival_scores"],
+                batch["action_mask"],
+                int(sel_cfg.get("top_m", 4)),
+            )
+
+            selected = capped_greedy_select_batch(
+                out["signed_evidence"],
+                out["rival_scores"],
+                pair_mask,
+                batch["evidence_mask"],
+                batch["evidence_cost"],
+                float(sel_cfg.get("budget", 32)),
+                float(sel_cfg.get("eta_e", 0.05)),
+                float(sel_cfg.get("gamma0", 1.0)),
+            )
+
+            q, _ = compute_q_scores(
+                out["signed_evidence"],
+                selected,
+                pair_mask,
+                batch["action_mask"],
+            )
+
+            loss, logs = compute_total_loss(out, batch, pair_mask, q, loss_cfg)
             scaler.scale(loss).backward()
             if float(cfg["training"].get("grad_clip_norm", 0.0)) > 0:
                 scaler.unscale_(opt)

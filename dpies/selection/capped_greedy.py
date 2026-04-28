@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import torch
 
+def neg_large_like(x: torch.Tensor) -> float:
+    """A large negative value representable by x.dtype."""
+    if x.dtype == torch.float16:
+        return -1.0e4
+    if x.dtype == torch.bfloat16:
+        return -1.0e6
+    return -1.0e9
 
 def make_directed_pair_mask(rival_scores: torch.Tensor, action_mask: torch.Tensor, top_m: int) -> torch.Tensor:
     """Top-M screened rivals per action. Returns [B,K,K] bool directed pair mask."""
@@ -10,7 +17,8 @@ def make_directed_pair_mask(rival_scores: torch.Tensor, action_mask: torch.Tenso
     valid = action_mask.bool()
     eye = torch.eye(k, dtype=torch.bool, device=scores.device)[None]
     pair_valid = valid[:, :, None] & valid[:, None, :] & (~eye)
-    scores = scores.masked_fill(~pair_valid, -1e9)
+    scores = scores.float()
+    scores = scores.masked_fill(~pair_valid, neg_large_like(scores))
     m = min(top_m, max(k - 1, 1))
     idx = torch.topk(scores, k=m, dim=-1).indices
     mask = torch.zeros((b, k, k), dtype=torch.bool, device=scores.device)
@@ -100,10 +108,12 @@ def compute_q_scores(signed: torch.Tensor, selected_mask: torch.Tensor, pair_mas
 
     signed [B,N,K,K], selected [B,N], pair_mask [B,K,K].
     """
+    signed = signed.float()
     dmat = (signed * selected_mask[:, :, None, None].to(signed.dtype)).sum(dim=1)
     b, k, _ = dmat.shape
-    neg_large = torch.tensor(-1e9, dtype=signed.dtype, device=signed.device)
-    q = torch.full((b, k), -1e9, dtype=signed.dtype, device=signed.device)
+
+    neg_large = torch.tensor(neg_large_like(signed), dtype=signed.dtype, device=signed.device)
+    q = torch.full((b, k), neg_large_like(signed), dtype=signed.dtype, device=signed.device)
     for i in range(b):
         for a in range(k):
             if not bool(action_mask[i, a]):

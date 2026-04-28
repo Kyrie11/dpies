@@ -3,6 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+def neg_large_like(x: torch.Tensor) -> float:
+    if x.dtype == torch.float16:
+        return -1.0e4
+    if x.dtype == torch.bfloat16:
+        return -1.0e6
+    return -1.0e9
 
 def screening_loss(rival_logits: torch.Tensor, rival_label: torch.Tensor, action_mask: torch.Tensor,
                    positive_weight_alpha: float = 5.0) -> torch.Tensor:
@@ -33,27 +39,47 @@ def evidence_loss(pred_signed: torch.Tensor, target_signed: torch.Tensor, active
     return loss[valid].mean()
 
 
-def action_identity_loss(q_scores: torch.Tensor, oracle: torch.Tensor, action_mask: torch.Tensor, tau_q: float = 1.0) -> torch.Tensor:
+def action_identity_loss(
+    q_scores: torch.Tensor,
+    oracle: torch.Tensor,
+    action_mask: torch.Tensor,
+    tau_q: float = 1.0,) -> torch.Tensor:
+    q_scores = q_scores.float()
     logits = q_scores / max(tau_q, 1e-6)
-    logits = logits.masked_fill(~action_mask.bool(), -1e9)
+    logits = logits.masked_fill(~action_mask.bool(), neg_large_like(logits))
     return F.cross_entropy(logits, oracle.long())
 
 
-def hard_negative_loss(q_scores: torch.Tensor, oracle: torch.Tensor, action_mask: torch.Tensor, margin: float = 0.5) -> torch.Tensor:
+def hard_negative_loss(
+    q_scores: torch.Tensor,
+    oracle: torch.Tensor,
+    action_mask: torch.Tensor,
+    margin: float = 0.5,
+) -> torch.Tensor:
+    q_scores = q_scores.float()
     b, k = q_scores.shape
     losses = []
+    neg_large = neg_large_like(q_scores)
+
     for i in range(b):
         valid = action_mask[i].bool().clone()
         if valid.sum() <= 1:
             losses.append(q_scores[i].sum() * 0.0)
             continue
+
         o = int(oracle[i].item())
         competitor_scores = q_scores[i].clone()
-        competitor_scores[~valid] = -1e9
-        competitor_scores[o] = -1e9
+        competitor_scores[~valid] = neg_large
+        competitor_scores[o] = neg_large
+
         neg = competitor_scores.max()
         pos = q_scores[i, o]
-        losses.append(torch.relu(torch.tensor(margin, dtype=q_scores.dtype, device=q_scores.device) + neg - pos))
+        losses.append(
+            torch.relu(
+                torch.tensor(margin, dtype=q_scores.dtype, device=q_scores.device) + neg - pos
+            )
+        )
+
     return torch.stack(losses).mean()
 
 

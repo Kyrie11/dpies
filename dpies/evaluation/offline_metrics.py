@@ -5,7 +5,9 @@ import torch
 
 def batch_action_metrics(q_scores: torch.Tensor, oracle: torch.Tensor, teacher_cost: torch.Tensor,
                          action_mask: torch.Tensor, topk: tuple[int, ...] = (1, 3, 5)) -> dict[str, float]:
-    masked_q = q_scores.masked_fill(~action_mask.bool(), -1e9)
+    q_scores = q_scores.float()
+    neg_large = -1.0e9
+    masked_q = q_scores.masked_fill(~action_mask.bool(), neg_large)
     pred = masked_q.argmax(dim=-1)
     b, k = q_scores.shape
     out: dict[str, float] = {}
