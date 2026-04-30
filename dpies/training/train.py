@@ -5,6 +5,7 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -43,8 +44,8 @@ def decision_outputs_fp32(out: dict) -> dict:
         out["signed_evidence"] = out["signed_evidence"].float()
     return out
 
+
 def init_distributed() -> tuple[bool, int, int, int]:
-    """Initialize torchrun/DDP if LOCAL_RANK is present."""
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     if local_rank < 0:
         return False, 0, 0, 1
@@ -53,7 +54,12 @@ def init_distributed() -> tuple[bool, int, int, int]:
         raise RuntimeError("DDP requires CUDA in this training script.")
 
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+
+    timeout_minutes = int(os.environ.get("DPIES_DDP_TIMEOUT_MINUTES", "120"))
+    dist.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=timeout_minutes),
+    )
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -99,7 +105,9 @@ def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     }
     if scaler is not None:
         obj["scaler"] = scaler.state_dict()
-    torch.save(obj, path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def main() -> None:
@@ -302,12 +310,16 @@ def main() -> None:
 
             global_step += 1
 
+            # /*来自 GPT-5.5 Thinking*/
             if save_interval_steps > 0 and global_step % save_interval_steps == 0:
                 step_metrics = {
                     "global_step": global_step,
                     "epoch": epoch,
                     **{k: float(v / max(seen, 1)) for k, v in sums.items()},
                 }
+
+                if distributed:
+                    dist.barrier()
 
                 if is_main_process(rank):
                     save_checkpoint(
@@ -331,13 +343,14 @@ def main() -> None:
                         scaler=scaler,
                     )
 
+                if distributed:
+                    dist.barrier()
+
             if is_main_process(rank) and step % max(log_interval, 1) == 0:
                 pbar.set_postfix({k: f"{v / max(seen, 1):.4f}" for k, v in sums.items() if k.startswith("loss")})
 
-        train_logs = reduce_train_logs(sums, seen, device, distributed)
 
-        if distributed:
-            dist.barrier()
+        train_logs = reduce_train_logs(sums, seen, device, distributed)
 
         validate_every = int(cfg["training"].get("validate_every_epochs", 1))
         val_metrics = {}
