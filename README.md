@@ -148,13 +148,28 @@ bash scripts/build_cache_val.sh
 Strict HD-map mode:
 
 ```bash
-python -m dpies.data.preprocess_nuplan \
-  --data-root "$DATA_ROOT" \
-  --map-root "$MAP_ROOT" \
-  --output-dir ./cache/val_map_required \
-  --subdirs val \
-  --require-map \
-  --continue-on-error
+ python -m dpies.data.preprocess_nuplan \
+  --data-root /data0/senzeyu2/dataset/nuplan/data/cache \
+  --map-root /data0/senzeyu2/dataset/nuplan/maps \  
+  --output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed \  
+  --subdirs train_boston train_pittsburgh train_vegas_2 train_singapore \  
+  --sample-interval-s 1.0  \ 
+  --history-seconds 2.0  \ 
+  --future-seconds 8.0  \ 
+  --dt 0.5  \ 
+  --max-agents 64 \  
+  --agent-radius-m 80 \  
+  --max-actions 32  \ 
+  --max-evidence-units 128  \ 
+  --max-map-polylines 128 \  
+  --max-map-points 20  \ 
+  --map-radius-m 50  \ 
+  --map-version nuplan-maps-v1.0 \  
+  --require-map  \ 
+  --continue-on-error  \ 
+  --skip-existing  \ 
+  --num-workers 8  \ 
+  --slim-cache 
 ```
 
 Recommended v1.1 official-devkit Scenario API mode:
@@ -202,8 +217,26 @@ SAMPLE_INTERVAL_S=2.0 bash scripts/build_cache_val.sh
 ## 5. Preprocess training cache
 
 ```bash
-python -m dpies.data.preprocess_nuplan --data-root /data0/senzeyu2/dataset/nuplan/data/cache --map-root /data0/senzeyu2/dataset/nuplan/maps --output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train --subdirs train_boston train_pittsburgh train_vegas_2 train_singapore --sample-interval-s 1.0 --history-seconds 2.0 --future-seconds 8.0 --dt 0.5 --max-agents 64 --agent-radius-m 80 --max-actions 32 --max-evidence-units 128 --max-map-polylines 128 --max-map-points 20 --map-radius-m 50 --map-version nuplan-maps-v1.0 --require-map --continue-on-error --skip-existing
-
+python -m dpies.data.preprocess_nuplan \ 
+--data-root /data0/senzeyu2/dataset/nuplan/data/cache \
+--map-root /data0/senzeyu2/dataset/nuplan/maps \
+--output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_train \
+--subdirs train_boston train_pittsburgh train_vegas_2 train_singapore \
+--sample-interval-s 1.0 \
+--history-seconds 2.0 \
+--future-seconds 8.0 \
+--dt 0.5 \
+--max-agents 64 \
+--agent-radius-m 80 \
+--max-actions 32 \
+--max-evidence-units 128 \
+--max-map-polylines 128 \
+--max-map-points 20 \
+--map-radius-m 50 \
+--map-version nuplan-maps-v1.0 \
+--require-map \
+--continue-on-error \
+--skip-existing
 ```
 
 Script form:
@@ -273,6 +306,26 @@ python -m dpies.training.train \
   --output-dir ./runs/dpies_main
 ```
 
+### 7.1 Distributed Training
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 \
+ -m dpies.training.train \
+ --config configs/train.yaml \
+ --cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed \
+ --val-cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val \
+ --output-dir ./runs/dpies_sanity_ddp2_twostage \
+ --resume ./runs/dpies_sanity_ddp2_twostage/last.pt \
+ --override \
+    training.epochs=20 \
+    training.log_interval=10 \
+    data.batch_size=12 \[added_refs.bib](../../Download/added_refs.bib)
+    data.num_workers=8 \
+    data.prefetch_factor=2 \
+    training.mixed_precision=true \
+    training.two_stage_signed_evidence=true \
+    training.max_val_batches=200 \
+    training.save_interval_steps=1000
+```
 or:
 
 ```bash

@@ -88,13 +88,17 @@ def reduce_train_logs(
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, epoch: int,
                     cfg: dict, metrics: dict) -> None:
     ensure_dir(path.parent)
-    torch.save({
+    obj = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
+        "global_step": global_step,
         "config": cfg,
         "metrics": metrics,
-    }, path)
+    }
+    if scaler is not None:
+        obj["scaler"] = scaler.state_dict()
+    torch.save(obj, path)
 
 
 def main() -> None:
@@ -196,20 +200,30 @@ def main() -> None:
         weight_decay=float(cfg["training"].get("weight_decay", 1e-4)),
     )
 
+    # /*来自 GPT-5.5 Thinking*/
     start_epoch = 0
     best_match = -1.0
+    global_step = 0
+    resume_ckpt = None
+
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        unwrap_model(model).load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["optimizer"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_match = float(ckpt.get("metrics", {}).get("action_match", -1.0))
+        resume_ckpt = torch.load(args.resume, map_location=device)
+        unwrap_model(model).load_state_dict(resume_ckpt["model"])
+        opt.load_state_dict(resume_ckpt["optimizer"])
+        start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
+        best_match = float(resume_ckpt.get("metrics", {}).get("action_match", -1.0))
+        global_step = int(resume_ckpt.get("global_step", 0))
+
     use_amp = bool(cfg["training"].get("mixed_precision", True)) and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    if resume_ckpt is not None and "scaler" in resume_ckpt:
+        scaler.load_state_dict(resume_ckpt["scaler"])
     loss_cfg = cfg.get("loss", {})
     sel_cfg = cfg.get("selection", {})
     epochs = int(cfg["training"].get("epochs", 20))
     log_interval = int(cfg["training"].get("log_interval", 20))
+    save_interval_steps = int(cfg["training"].get("save_interval_steps", 0) or 0)
     history = []
 
     for epoch in range(start_epoch, epochs):
@@ -232,7 +246,7 @@ def main() -> None:
                 if two_stage_signed_evidence:
                     out = unwrap_model(model).forward_rival(batch)
                 else:
-                    out = model(batch, mode="rival")
+                    out = model(batch, mode="full")
 
             out = decision_outputs_fp32(out)
 
@@ -280,10 +294,72 @@ def main() -> None:
             scaler.step(opt)
             scaler.update()
 
+            global_step += 1
+
+            if save_interval_steps > 0 and global_step % save_interval_steps == 0:
+                step_metrics = {
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    **{k: float(v / max(seen, 1)) for k, v in sums.items()},
+                }
+
+                if is_main_process(rank):
+                    save_checkpoint(
+                        out_dir / f"step_{global_step:08d}.pt",
+                        unwrap_model(model),
+                        opt,
+                        epoch,
+                        cfg,
+                        step_metrics,
+                        global_step=global_step,
+                        scaler=scaler,
+                    )
+                    save_checkpoint(
+                        out_dir / "last.pt",
+                        unwrap_model(model),
+                        opt,
+                        epoch,
+                        cfg,
+                        step_metrics,
+                        global_step=global_step,
+                        scaler=scaler,
+                    )
+
             bs = int(batch["actions"].shape[0])
             seen += bs
             for key, val in logs.items():
                 sums[key] += float(val.item()) * bs
+
+            global_step += 1
+
+            if save_interval_steps > 0 and global_step % save_interval_steps == 0:
+                step_metrics = {
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    **{k: float(v / max(seen, 1)) for k, v in sums.items()},
+                }
+
+                if is_main_process(rank):
+                    save_checkpoint(
+                        out_dir / f"step_{global_step:08d}.pt",
+                        unwrap_model(model),
+                        opt,
+                        epoch,
+                        cfg,
+                        step_metrics,
+                        global_step=global_step,
+                        scaler=scaler,
+                    )
+                    save_checkpoint(
+                        out_dir / "last.pt",
+                        unwrap_model(model),
+                        opt,
+                        epoch,
+                        cfg,
+                        step_metrics,
+                        global_step=global_step,
+                        scaler=scaler,
+                    )
 
             if is_main_process(rank) and step % max(log_interval, 1) == 0:
                 pbar.set_postfix({k: f"{v / max(seen, 1):.4f}" for k, v in sums.items() if k.startswith("loss")})
@@ -329,10 +405,11 @@ def main() -> None:
                 epoch,
                 cfg,
                 val_metrics,
+                global_step=global_step,
+                scaler=scaler,
             )
 
             if val_metrics.get("action_match", 0.0) > best_match:
-                best_match = val_metrics.get("action_match", 0.0)
                 save_checkpoint(
                     out_dir / "best.pt",
                     unwrap_model(model),
@@ -340,6 +417,8 @@ def main() -> None:
                     epoch,
                     cfg,
                     val_metrics,
+                    global_step=global_step,
+                    scaler=scaler,
                 )
 
         if distributed:
