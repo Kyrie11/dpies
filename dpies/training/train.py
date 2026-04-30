@@ -86,7 +86,8 @@ def reduce_train_logs(
     return {k: float(t[i + 1].item() / total_seen) for i, k in enumerate(keys)}
 
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, epoch: int,
-                    cfg: dict, metrics: dict) -> None:
+                    cfg: dict, metrics: dict, global_step: int = 0,
+                    scaler: torch.amp.GradScaler = None) -> None:
     ensure_dir(path.parent)
     obj = {
         "model": model.state_dict(),
@@ -294,37 +295,6 @@ def main() -> None:
             scaler.step(opt)
             scaler.update()
 
-            global_step += 1
-
-            if save_interval_steps > 0 and global_step % save_interval_steps == 0:
-                step_metrics = {
-                    "global_step": global_step,
-                    "epoch": epoch,
-                    **{k: float(v / max(seen, 1)) for k, v in sums.items()},
-                }
-
-                if is_main_process(rank):
-                    save_checkpoint(
-                        out_dir / f"step_{global_step:08d}.pt",
-                        unwrap_model(model),
-                        opt,
-                        epoch,
-                        cfg,
-                        step_metrics,
-                        global_step=global_step,
-                        scaler=scaler,
-                    )
-                    save_checkpoint(
-                        out_dir / "last.pt",
-                        unwrap_model(model),
-                        opt,
-                        epoch,
-                        cfg,
-                        step_metrics,
-                        global_step=global_step,
-                        scaler=scaler,
-                    )
-
             bs = int(batch["actions"].shape[0])
             seen += bs
             for key, val in logs.items():
@@ -410,6 +380,7 @@ def main() -> None:
             )
 
             if val_metrics.get("action_match", 0.0) > best_match:
+                best_match = val_metrics.get("action_match", 0.0)
                 save_checkpoint(
                     out_dir / "best.pt",
                     unwrap_model(model),
