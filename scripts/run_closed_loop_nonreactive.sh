@@ -22,6 +22,7 @@ python "${NUPLAN_DEVKIT_ROOT}/nuplan/planning/script/run_simulation.py" \
   planner.dpies_planner.device="${DEVICE:-cuda}" \
   planner.dpies_planner.budget="${BUDGET:-32}" \
   scenario_builder="${SCENARIO_BUILDER:-nuplan}" \
+  scenario_builder.db_files="${DB_FILES:-/data0/senzeyu2/dataset/nuplan/data/cache/val}" \
   scenario_filter="${SCENARIO_FILTER:-one_of_each_scenario_type}" \
   scenario_filter.limit_total_scenarios="${LIMIT_SCENARIOS:-20}" \
   worker="${WORKER:-sequential}" \

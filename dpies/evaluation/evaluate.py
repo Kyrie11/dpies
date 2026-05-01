@@ -39,8 +39,10 @@ def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: flo
     for batch in tqdm(loader, desc=f"B={budget}"):
         batch = to_device(batch, device)
         start = time.perf_counter()
-        out = model(batch)
+        out = model.forward_rival(batch)
         pair_mask = make_directed_pair_mask(out["rival_scores"], batch["action_mask"], top_m)
+        signed = model.signed_evidence_for_pair_mask(batch,out,pair_mask)
+        out['signed_evidence'] = signed.float()
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              batch["evidence_mask"], batch["evidence_cost"], budget, eta_e, gamma0)
         q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"])
