@@ -7,6 +7,8 @@ DPIES preprocessing logic schema-consistent with offline cache generation:
 PlannerInitialization/PlannerInput -> ego/agent/map/action/evidence/query tensors
 -> DPIESNetwork -> capped evidence selection -> max-min action -> InterpolatedTrajectory.
 """
+import json
+from pathlib import Path
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,7 +270,26 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
             if idx < 0 or idx >= actions.shape[0] or not action_mask[idx]:
                 raise RuntimeError(f"invalid DPIES selected action index {idx}")
-            self.last_debug.update({"selected_action": idx, "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0]})
+            mode = int(batch["action_meta"][0, idx, 0].item())
+            progress = float(batch["actions"][0, idx, -1, 0].item())
+            final_speed = float(batch["actions"][0, idx, -1, 3].item())
+            self.last_debug.update({"selected_action": idx, "selected_mode": mode, "selected_progress": progress,
+                                    "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0],
+                                    "selected_final_speed":final_speed})
+
+            debug_path = Path("runs/closed_loop_action_debug.jsonl")
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            with debug_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "selected_action": idx,
+                    "selected_mode": mode,
+                    "selected_progress": progress,
+                    "selected_final_speed": final_speed,
+                    "q_selected": float(q[0, idx].item()),
+                    "valid_action_count": int(batch["action_mask"][0].sum().item()),
+                    "evidence_count": int(batch["evidence_mask"][0].sum().item()),
+                    "debug": self.last_debug,
+                }, ensure_ascii=False) + "\n")
             return self._trajectory_from_action(current_ego, actions[idx])
         except Exception as exc:
             self.last_debug.update({"fallback_reason": str(exc)})
