@@ -358,6 +358,7 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "evidence_count": int(batch["evidence_mask"][0].sum().item()),
                     "debug": self.last_debug,
                 }, ensure_ascii=False) + "\n")
+                fh.flush()
             # print({
             #     "selected_action": idx,
             #     "selected_mode": mode,
