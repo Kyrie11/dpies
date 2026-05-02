@@ -130,6 +130,8 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         rule_units=map_obj.rule_units,
         traffic_lights=traffic_lights_current,
     )
+    action_filter_trace = getattr(action_gen, "last_filter_trace", {})
+
     if not action_mask.any():
         return None
 
@@ -193,6 +195,9 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         "evidence_count": int(evidence_mask.sum()),
         "dt": float(args.dt),
         "ego_dim": int(ego_history.shape[-1]),
+        "action_filter_pre_count": int(action_filter_trace.get("pre_count", -1)),
+        "action_filter_post_count": int(action_filter_trace.get("post_count", -1)),
+        "action_filter_dropped_count": int(len(action_filter_trace.get("dropped", []))),
     }
     sample = {
         "ego_history": ego_history.astype(np.float32),
@@ -227,6 +232,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         "evidence_metadata_json": json_bytes(evidence_metadata),
         "route_info_json": json_bytes(map_obj.route_info),
         "traffic_lights_json": json_bytes({"current": traffic_lights_current, "future": traffic_lights_future}),
+        "action_filter_trace_json": json_bytes(action_filter_trace),
     }
 
     if getattr(args, "slim_cache", False):

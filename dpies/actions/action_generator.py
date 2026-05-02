@@ -184,7 +184,10 @@ class ActionGenerator:
         if not actions:
             traj = stop_rollout(current_speed, 5.0, self.cfg.horizon_s, self.cfg.dt)
             actions.append(self._make(ActionMode.STOP, traj, 0.0, 0.0, 5.0))
-        actions = diversity_filter(actions, self.cfg.max_actions)
+        pre_filter_actions = list(actions)
+        actions, filter_trace = diversity_filter(actions, self.cfg.max_actions, return_trace=True)
+        self.last_filter_trace = filter_trace
+        self.last_pre_filter_count = len(pre_filter_actions)
         k = self.cfg.max_actions
         steps = int(round(self.cfg.horizon_s / self.cfg.dt))
         trajs = np.zeros((k, steps, ACTION_STATE_DIM), dtype=np.float32)
