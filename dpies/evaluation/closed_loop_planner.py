@@ -358,7 +358,16 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "evidence_count": int(batch["evidence_mask"][0].sum().item()),
                     "debug": self.last_debug,
                 }, ensure_ascii=False) + "\n")
-
+            print({
+                "selected_action": idx,
+                "selected_mode": mode,
+                "selected_progress": progress,
+                "selected_final_speed": final_speed,
+                "q_selected": float(q[0, idx].item()),
+                "valid_action_count": int(batch["action_mask"][0].sum().item()),
+                "evidence_count": int(batch["evidence_mask"][0].sum().item()),
+                "debug": self.last_debug
+            })
             self.last_debug.update({"selected_action": idx, "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0], "input_s": input_s, "model_select_s": model_select_s})
 
 
