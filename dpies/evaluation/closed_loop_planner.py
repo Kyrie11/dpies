@@ -300,6 +300,11 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             actions = batch["actions"][0].cpu().numpy()
             action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
 
+            rerank_reason = "model_argmax"
+            raw_idx = idx
+            min_progress = None
+            selected_comfort = None
+            selected_rerank_score = None
             # Optional deployment rerank: keep DPIES q as the base score, but avoid
             # low-progress or uncomfortable trajectories when q is close.
             if self.cfg.progress_rerank_weight != 0.0 or self.cfg.comfort_rerank_penalty != 0.0:
@@ -312,6 +317,7 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
 
                 current_speed = float(batch["ego_history"][0, -1, 8].item())
                 min_progress = max(8.0, 0.65 * current_speed * self.cfg.future_seconds)
+
 
                 score = q0.clone()
                 score = score.masked_fill(~valid, -1e9)
@@ -326,19 +332,25 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                 fallback1 = valid & progress_ok
                 fallback2 = valid & comfort_ok
 
+                raw_idx = int(pred[0].item)
                 if preferred.any():
                     cand = preferred
+                    rerank_reason = "preferred_progress_and_comfort"
                 elif fallback1.any():
                     cand = fallback1
+                    rerank_reason = "fallback_progress_only"
                 elif fallback2.any():
                     cand = fallback2
+                    rerank_reason = "fallback_comfort_only"
                 else:
                     cand = valid
-
+                    rerank_reason = "fallback_any_valid"
                 # 3. 在候选集合内再用 q + route/progress bias 排序
                 score = q0 + 0.10 * progress - 10.0 * comfort
                 score = score.masked_fill(~cand, -1e9)
                 idx = int(score.argmax().item())
+                selected_comfort = float(comfort[idx].item())
+                selected_rerank_score = float(score[idx].item())
             if idx < 0 or idx >= actions.shape[0] or not action_mask[idx]:
                 raise RuntimeError(f"invalid DPIES selected action index {idx}")
             mode = int(batch["action_meta"][0, idx, 0].item())
@@ -357,24 +369,28 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "valid_action_count": int(batch["action_mask"][0].sum().item()),
                     "evidence_count": int(batch["evidence_mask"][0].sum().item()),
                     "debug": self.last_debug,
+                    "raw_model_action": raw_idx,
+                    "rerank_reason": rerank_reason,
+                    "min_progress": None if min_progress is None else float(min_progress),
+                    "selected_comfort_violation": selected_comfort,
+                    "selected_rerank_score": selected_rerank_score
                 }, ensure_ascii=False) + "\n")
                 fh.flush()
-            # print({
-            #     "selected_action": idx,
-            #     "selected_mode": mode,
-            #     "selected_progress": progress,
-            #     "selected_final_speed": final_speed,
-            #     "q_selected": float(q[0, idx].item()),
-            #     "valid_action_count": int(batch["action_mask"][0].sum().item()),
-            #     "evidence_count": int(batch["evidence_mask"][0].sum().item()),
-            #     "debug": self.last_debug
-            # })
+
             self.last_debug.update({"selected_action": idx, "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0], "input_s": input_s, "model_select_s": model_select_s})
 
 
             return self._trajectory_from_action(current_ego, actions[idx])
         except Exception as exc:
             self.last_debug.update({"fallback_reason": str(exc)})
+            ebug_path = Path("runs/closed_loop_action_debug.jsonl")
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            with debug_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "fallback": True,
+                    "fallback_reason": str(exc),
+                    "debug": self.last_debug,
+                }, ensure_ascii=False)+"\n")
             if not self.cfg.fallback_on_error:
                 raise
             return self._fallback_trajectory(current_ego)
