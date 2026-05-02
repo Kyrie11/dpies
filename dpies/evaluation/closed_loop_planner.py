@@ -332,7 +332,6 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                 fallback1 = valid & progress_ok
                 fallback2 = valid & comfort_ok
 
-                raw_idx = int(pred[0].item)
                 if preferred.any():
                     cand = preferred
                     rerank_reason = "preferred_progress_and_comfort"
