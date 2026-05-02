@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover
         pass
 
 from dpies.actions.action_generator import ActionGenerator, ActionGeneratorConfig
+from dpies.actions.trajectory_quality import batch_action_quality
 from dpies.common.geometry import ego_to_global_points
 from dpies.data.devkit_utils import traffic_from_planner_input
 from dpies.data.map_provider import NuPlanMapProvider
@@ -304,13 +305,41 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             # Optional deployment rerank: keep DPIES q as the base score, but avoid
             # low-progress or uncomfortable trajectories when q is close.
             if self.cfg.progress_rerank_weight != 0.0 or self.cfg.comfort_rerank_penalty != 0.0:
-                from dpies.actions.trajectory_quality import batch_action_quality
                 qual = batch_action_quality(actions, action_mask, self.cfg.dt)
-                score = q[0].clone()
-                progress = torch.as_tensor(qual["progress"], dtype=score.dtype)
-                comfort = torch.as_tensor(qual["comfort_violation"], dtype=score.dtype)
-                score = score + self.cfg.progress_rerank_weight * progress - self.cfg.comfort_rerank_penalty * comfort
-                score = score.masked_fill(~batch["action_mask"][0].bool(), -1e9)
+                q0 = q[0].clone()
+                valid = batch["action_mask"][0].bool()
+
+                progress = torch.as_tensor(qual["progress"], dtype=q0.dtype)
+                comfort = torch.as_tensor(qual["comfort_violation"], dtype=q0.dtype)
+
+                current_speed = float(batch["ego_history"][0, -1, 8].item())
+                min_progress = max(8.0, 0.65 * current_speed * self.cfg.future_seconds)
+
+                score = q0.clone()
+                score = score.masked_fill(~valid, -1e9)
+
+                # 1. 优先筛掉明显不前进的动作
+                progress_ok = progress >= min_progress
+
+                # 2. 优先使用舒适动作
+                comfort_ok = comfort < 0.5
+
+                preferred = valid & progress_ok & comfort_ok
+                fallback1 = valid & progress_ok
+                fallback2 = valid & comfort_ok
+
+                if preferred.any():
+                    cand = preferred
+                elif fallback1.any():
+                    cand = fallback1
+                elif fallback2.any():
+                    cand = fallback2
+                else:
+                    cand = valid
+
+                # 3. 在候选集合内再用 q + route/progress bias 排序
+                score = q0 + 0.10 * progress - 10.0 * comfort
+                score = score.masked_fill(~cand, -1e9)
                 idx = int(score.argmax().item())
             if idx < 0 or idx >= actions.shape[0] or not action_mask[idx]:
                 raise RuntimeError(f"invalid DPIES selected action index {idx}")
