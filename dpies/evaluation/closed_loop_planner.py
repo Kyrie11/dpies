@@ -40,18 +40,22 @@ class DPIESClosedLoopConfig:
     future_seconds: float = 8.0
     dt: float = 0.5
     max_agents: int = 64
-    agent_radius_m: float = 80.0
+    agent_radius_m: float = 60.0
     max_actions: int = 32
-    max_evidence_units: int = 128
-    max_map_polylines: int = 256
+    max_evidence_units: int = 64
+    max_map_polylines: int = 128
     max_map_points: int = 20
-    map_radius_m: float = 80.0
+    map_radius_m: float = 50.0
     top_m: int = 4
-    budget: float = 32.0
+    budget: float = 24.0
     eta_e: float = 0.05
     gamma0: float = 1.0
     device: str = "cuda"
     fallback_on_error: bool = True
+    exact_online_map_query: bool = False
+    enable_timing_debug: bool = True
+    progress_rerank_weight: float = 0.03
+    comfort_rerank_penalty: float = 5.0
 
 
 class DPIESPlannerCore:
@@ -126,6 +130,11 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
         self.initialization = initialization
 
     def _planner_input_to_batch(self, current_input: Any) -> dict[str, torch.Tensor]:
+        import time
+        t_all = time.perf_counter()
+        timings = {}
+        t = time.perf_counter()
+
         history = current_input.history
         ego_states = list(history.ego_states)
         observations = list(history.observations)
@@ -142,6 +151,9 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             ego_yaw=ego_yaw,
             agent_radius_m=self.cfg.agent_radius_m,
         )
+        timings["history_s"] = time.perf_counter() - t
+        t = time.perf_counter()
+
         if self.initialization is None:
             raise RuntimeError("DPIESNuPlanPlanner.initialize() must be called before compute_planner_trajectory")
         route_ids = [str(x) for x in getattr(self.initialization, "route_roadblock_ids", [])]
@@ -158,6 +170,9 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             traffic_lights=traffic_light_records,
             future_traffic_lights=None,
         )
+        timings["map_extract_s"] = time.perf_counter() - t
+        t = time.perf_counter()
+
         actions, action_meta, action_mask = self.action_gen.generate(
             ego_history,
             agent_history=agent_history,
@@ -166,6 +181,9 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             rule_units=map_obj.rule_units,
             traffic_lights=traffic_light_records,
         )
+        timings["action_gen_s"] = time.perf_counter() - t
+        t = time.perf_counter()
+
         evidence_features, evidence_type, evidence_cost, evidence_mask = self.evidence_builder.build(
             agent_history,
             agent_mask,
@@ -175,6 +193,9 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             dt=self.cfg.dt,
             agent_history_mask=agent_history_mask,
         )
+        timings["evidence_build_s"] = time.perf_counter() - t
+        t = time.perf_counter()
+
         evidence_metadata = list(self.evidence_builder.last_metadata)
         geometry_query = compute_geometry_query(
             evidence_features,
@@ -185,7 +206,10 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             self.cfg.dt,
             evidence_metadata=evidence_metadata,
             route_info=map_obj.route_info,
+            exact_map_rules=self.cfg.exact_online_map_query,
         )
+        timings["geometry_query_s"] = time.perf_counter() - t
+        timings["planner_input_total_s"] = time.perf_counter() - t_all
         self.last_debug = {
             "map_success": bool(map_obj.success),
             "map_error": str(map_obj.error),
@@ -194,6 +218,7 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             "route_roadblocks": len(route_ids),
             "traffic_lights": len(traffic_light_records),
             "route_info": map_obj.route_info,
+            "timings": timings,
         }
 
         def ft(x: np.ndarray) -> torch.Tensor:
@@ -265,19 +290,35 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
         debug_path = Path("runs/closed_loop_action_debug.jsonl")
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            import time
+            t = time.perf_counter()
             batch = self._planner_input_to_batch(current_input)
+            input_s = time.perf_counter() - t
+            t = time.perf_counter()
             pred, q, selected = self.core.choose_action(batch)
+            model_select_s = time.perf_counter() - t
             idx = int(pred[0].item())
             actions = batch["actions"][0].cpu().numpy()
             action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
+
+            # Optional deployment rerank: keep DPIES q as the base score, but avoid
+            # low-progress or uncomfortable trajectories when q is close.
+            if self.cfg.progress_rerank_weight != 0.0 or self.cfg.comfort_rerank_penalty != 0.0:
+                from dpies.actions.trajectory_quality import batch_action_quality
+                qual = batch_action_quality(actions, action_mask, self.cfg.dt)
+                score = q[0].clone()
+                progress = torch.as_tensor(qual["progress"], dtype=score.dtype)
+                comfort = torch.as_tensor(qual["comfort_violation"], dtype=score.dtype)
+                score = score + self.cfg.progress_rerank_weight * progress - self.cfg.comfort_rerank_penalty * comfort
+                score = score.masked_fill(~batch["action_mask"][0].bool(), -1e9)
+                idx = int(score.argmax().item())
             if idx < 0 or idx >= actions.shape[0] or not action_mask[idx]:
                 raise RuntimeError(f"invalid DPIES selected action index {idx}")
             mode = int(batch["action_meta"][0, idx, 0].item())
             progress = float(batch["actions"][0, idx, -1, 0].item())
             final_speed = float(batch["actions"][0, idx, -1, 3].item())
-            self.last_debug.update({"selected_action": idx, "selected_mode": mode, "selected_progress": progress,
-                                    "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0],
-                                    "selected_final_speed":final_speed})
+            self.last_debug.update({"selected_action": idx, "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0], "input_s": input_s, "model_select_s": model_select_s})
+
             with debug_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({
                     "selected_action": idx,
