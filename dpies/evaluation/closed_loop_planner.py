@@ -345,7 +345,7 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             progress = float(batch["actions"][0, idx, -1, 0].item())
             final_speed = float(batch["actions"][0, idx, -1, 3].item())
 
-            debug_path = Path("~/code/dpies/runs/closed_loop_action_debug.jsonl")
+            debug_path = Path("runs/closed_loop_action_debug.jsonl")
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             with debug_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({
