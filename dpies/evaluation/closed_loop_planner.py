@@ -345,7 +345,11 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     cand = valid
                     rerank_reason = "fallback_any_valid"
                 # 3. 在候选集合内再用 q + route/progress bias 排序
-                score = q0 + 0.10 * progress - 10.0 * comfort
+                score = (
+                        q0
+                        + float(self.cfg.progress_rerank_weight) * progress
+                        - float(self.cfg.comfort_rerank_penalty) * comfort
+                )
                 score = score.masked_fill(~cand, -1e9)
                 idx = int(score.argmax().item())
                 selected_comfort = float(comfort[idx].item())
@@ -382,7 +386,7 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             return self._trajectory_from_action(current_ego, actions[idx])
         except Exception as exc:
             self.last_debug.update({"fallback_reason": str(exc)})
-            ebug_path = Path("runs/closed_loop_action_debug.jsonl")
+            debug_path = Path("runs/closed_loop_action_debug.jsonl")
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             with debug_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({

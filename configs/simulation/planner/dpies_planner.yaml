@@ -17,7 +17,11 @@ dpies_planner:
   max_map_points: 20
   map_radius_m: 80.0
   top_m: 4
-  budget: 32.0
+  budget: 24.0
   eta_e: 0.05
   gamma0: 1.0
   fallback_on_error: true
+  progress_rerank_weight: 0.0
+  comfort_rerank_penalty: 0.0
+  exact_online_map_query: false
+  enable_timing_debug: true

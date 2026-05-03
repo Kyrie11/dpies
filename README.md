@@ -135,7 +135,21 @@ DATA_ROOT=/data0/senzeyu2/dataset/nuplan/data/cache bash scripts/inspect_db.sh
 Recommended validation cache command:
 
 ```bash
-python -m dpies.data.preprocess_nuplan --data-root /data0/senzeyu2/dataset/nuplan/data/cache --map-root /data0/senzeyu2/dataset/nuplan/maps --output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val --subdirs val --sample-interval-s 1.0 --history-seconds 2.0 --future-seconds 8.0 --dt 0.5 --max-agents 64 --agent-radius-m 80 --max-actions 32 --max-evidence-units 128 --max-map-polylines 128 --max-map-points 20 --map-radius-m 50 --map-version nuplan-maps-v1.0 --require-map --continue-on-error --skip-existing
+python -m dpies.data.preprocess_nuplan \ 
+--data-root /data0/senzeyu2/dataset/nuplan/data/cache \
+--map-root /data0/senzeyu2/dataset/nuplan/maps \
+--output-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val \
+--subdirs val \
+--sample-interval-s 1.0 \
+--history-seconds 2.0 \
+--future-seconds 8.0 \
+--dt 0.5 \
+--max-agents 64 \
+--agent-radius-m 80 \
+--max-actions 32 \
+--max-evidence-units 128 \
+--max-map-polylines 128 \
+--max-map-points 20 --map-radius-m 50 --map-version nuplan-maps-v1.0 --require-map --continue-on-error --skip-existing
 
 ```
 
@@ -337,11 +351,10 @@ bash scripts/train.sh
 ## 8. Offline evaluation
 
 ```bash
-python -m dpies.evaluation.evaluate \
-  --config configs/eval.yaml \
-  --checkpoint ./runs/dpies_main/best.pt \
-  --cache-dir ./cache/val \
-  --output-dir ./runs/dpies_main/eval
+CUDA_VISIBLE_DEVICES=0 python -m dpies.evaluation.evaluate --config configs/eval.yaml \
+--checkpoint ./runs/dpies_sanity_ddp2_twostage/best.pt \
+--cache-dir /data0/senzeyu2/dataset/nuplan/data/cache/processed_val \
+--output-dir ./runs/dpies_sanity_ddp2_twostage/eval_best_[metrics.json](../../Download/metrics.json)fullval
 ```
 
 or:
@@ -492,3 +505,4 @@ python scripts/check_npz_cache.py   --cache-dir /data0/senzeyu2/dataset/nuplan/d
 ```bash
   python -m dpies.tools.debug_vis_npz /data0/senzeyu2/dataset/nuplan/data/cache/processed_train --out-dir ./vis --limit 25
 ```
+
