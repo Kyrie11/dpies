@@ -363,6 +363,9 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
 
             debug_path = Path("runs/closed_loop_action_debug.jsonl")
             debug_path.parent.mkdir(parents=True, exist_ok=True)
+            q_np = q[0].numpy()
+            order = np.argsort(np.where(action_mask, q_np, -1e9))[::-1][:8]
+            meta_np = batch["action_meta"][0].cpu().numpy()
             with debug_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({
                     "selected_action": idx,
@@ -377,7 +380,13 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "rerank_reason": rerank_reason,
                     "min_progress": None if min_progress is None else float(min_progress),
                     "selected_comfort_violation": selected_comfort,
-                    "selected_rerank_score": selected_rerank_score
+                    "selected_rerank_score": selected_rerank_score,
+                    "model_top8_actions": [int(x) for x in order],
+                    "model_top8_q": [float(q_np[x]) for x in order],
+                    "model_top8_mode": [int(meta_np[x, 0]) for x in order],
+                    "model_top8_progress": [float(actions[x, -1, 0]) for x in order],
+                    "model_top8_final_speed": [float(actions[x, -1, 3]) for x in order],
+                    "model_top8_terminal_lateral": [float(meta_np[x, 2]) for x in order],
                 }, ensure_ascii=False) + "\n")
                 fh.flush()
 
