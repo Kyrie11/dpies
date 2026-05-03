@@ -26,6 +26,9 @@ loss:
   lambda_evi: 1.0
   lambda_act: 1.0
   lambda_hn: 0.5
+  lambda_rank: 1.0
+  teacher_rank_margin_scale: 0.5
+  teacher_rank_max_pairs: 256
   positive_weight_alpha: 5.0
   huber_delta: 1.0
   tau_q: 1.0

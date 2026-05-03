@@ -24,6 +24,11 @@ class TeacherWeights:
     imitation_ade: float = 1.0
     imitation_fde: float = 1.0
     local_evidence: float = 1.0
+    low_progress: float = 20.0
+    stop_when_should_move: float = 15.0
+    future_collision: float = 50.0
+    future_proximity: float = 10.0
+    hard_comfort: float = 5.0
 
     # Optional legacy direct future-agent penalties. Keep disabled in the main
     # implementation unless running an ablation that intentionally double checks
@@ -115,6 +120,23 @@ class TeacherEvaluator:
                 future_col += np.where(m < w.collision_radius_m, 1.0 + (w.collision_radius_m - m), 0.0)
                 future_prox += np.exp(-m / max(w.proximity_sigma_m, 1e-3)).astype(np.float32)
 
+        expert_progress = float(max(logged_ego_future[-1, 0], 1.0)) if len(logged_ego_future) else 1.0
+        action_progress = actions[:, -1, 0]
+        final_speed = actions[:, -1, 3]
+
+        progress_ratio = action_progress / max(expert_progress, 1e-3)
+
+        low_progress_cost = np.maximum(0.75 - progress_ratio, 0.0) ** 2
+
+        # 如果 log future 明显在走，candidate 却几乎停住，强惩罚
+        expert_final_speed = 0.0
+        if len(logged_ego_future) >= 2:
+            diffs = np.diff(logged_ego_future[:, :2], axis=0)
+            expert_final_speed = float(np.linalg.norm(diffs[-1]) / max(dt, 1e-3))
+
+        should_move = float(expert_progress > 10.0 or expert_final_speed > 1.5)
+        stop_when_should_move_cost = should_move * np.maximum(1.0 - final_speed, 0.0) ** 2
+
         global_without_local = (
                 w.imitation_ade * ade_all
                 + w.imitation_fde * fde_all
@@ -125,6 +147,11 @@ class TeacherEvaluator:
                 + w.comfort_curvature * curv_cost_all
                 + w.future_collision * future_col
                 + w.future_proximity * future_prox
+                + w.low_progress * low_progress_cost
+                + w.stop_when_should_move * stop_when_should_move_cost
+                + w.hard_comfort * hard_comfort_cost
+                + w.future_collision * future_col
+                + w.future_proximity * future_pro
         )
         total = global_without_local + w.local_evidence * local_sum
         costs[valid_idx] = total[valid_idx].astype(np.float32)

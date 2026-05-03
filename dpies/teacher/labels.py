@@ -23,25 +23,46 @@ def normalize_costs(costs: np.ndarray, action_mask: np.ndarray, eps: float = 1e-
     return out
 
 
-def rival_labels(costs: np.ndarray, action_mask: np.ndarray, top_rank_l: int = 8, margin_delta: float = 0.5) -> np.ndarray:
-    """Return directed rival labels. top_rank_l means the best L actions using zero-based ranks rank < L."""
+def rival_labels(
+    costs: np.ndarray,
+    action_mask: np.ndarray,
+    top_rank_l: int = 12,
+    margin_delta: float = 0.75,
+    oracle_vs_l: int = 24,
+    include_oracle_pairs: bool = True,
+) -> np.ndarray:
     k = len(costs)
     labels = np.zeros((k, k), dtype=bool)
     valid_idx = np.where(action_mask)[0]
     if len(valid_idx) < 2:
         return labels
+
     norm = normalize_costs(costs, action_mask)
     order = valid_idx[np.argsort(costs[valid_idx])]
+    oracle = int(order[0])
+
     rank = np.full((k,), 10_000, dtype=np.int64)
     for r, idx in enumerate(order):
         rank[idx] = r
+
     for i in valid_idx:
         for j in valid_idx:
             if i == j:
                 continue
-            competitive = min(rank[i], rank[j]) < top_rank_l
-            near = abs(float(norm[i] - norm[j])) <= margin_delta
-            labels[i, j] = bool(competitive and near)
+
+            top_near = (
+                min(rank[i], rank[j]) < top_rank_l
+                and abs(float(norm[i] - norm[j])) <= margin_delta
+            )
+
+            oracle_pair = (
+                include_oracle_pairs
+                and (i == oracle or j == oracle)
+                and max(rank[i], rank[j]) < oracle_vs_l
+            )
+
+            labels[i, j] = bool(top_near or oracle_pair)
+
     return labels
 
 

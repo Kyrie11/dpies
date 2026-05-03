@@ -23,6 +23,11 @@ class DPIESConfig:
     hidden_dim: int = 256
     dropout: float = 0.1
     pair_chunk_size: int = 64
+    continuity_weight: float = 1.0
+    continuity_speed_weight: float = 1.0
+    continuity_lateral_weight: float = 0.5
+    continuity_progress_weight: float = 0.05
+    continuity_mode_switch_weight: float = 0.5
 
 
 class DPIESNetwork(nn.Module):

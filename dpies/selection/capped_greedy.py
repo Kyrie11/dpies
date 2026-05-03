@@ -103,40 +103,39 @@ def capped_greedy_select_batch(signed: torch.Tensor, pair_scores: torch.Tensor, 
 
 
 def compute_q_scores(
-    signed: torch.Tensor,
-    selected_mask: torch.Tensor,
-    pair_mask: torch.Tensor,
-    action_mask: torch.Tensor,
+        signed: torch.Tensor,
+        selected_mask: torch.Tensor,
+        pair_mask: torch.Tensor,
+        action_mask: torch.Tensor,
+        action_prior: torch.Tensor | None = None,
+        softmin_tau: float = 2.0,
+        hard_min_weight: float = 0.3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute D_SB and max-min Q for screened rivals.
-
-    signed: [B,N,K,K]
-    selected_mask: [B,N]
-    pair_mask: [B,K,K]
-    action_mask: [B,K]
-    """
     signed = signed.float()
-
-    # [B,K,K]
     dmat = (signed * selected_mask[:, :, None, None].to(signed.dtype)).sum(dim=1)
 
-    # valid rival relation: screened pair and both actions valid
     valid_pair = (
-        pair_mask.bool()
-        & action_mask[:, :, None].bool()
-        & action_mask[:, None, :].bool()
+            pair_mask.bool()
+            & action_mask[:, :, None].bool()
+            & action_mask[:, None, :].bool()
     )
 
-    # q[a] = min_b D(a,b) over valid screened rivals b
-    inf = torch.tensor(float("inf"), dtype=dmat.dtype, device=dmat.device)
-    masked = dmat.masked_fill(~valid_pair, inf)
-    q = masked.min(dim=-1).values
+    neg_large = neg_large_like(dmat)
+    masked = dmat.masked_fill(~valid_pair, float("inf"))
 
-    # If an action has no rival, mark it invalid with a large negative value.
+    hard_q = masked.min(dim=-1).values
+
+    # soft-min over rivals: less dominated by one noisy pair
+    z = dmat.masked_fill(~valid_pair, neg_large)
+    count = valid_pair.sum(dim=-1).clamp_min(1).to(dmat.dtype)
+    soft_q = -softmin_tau * torch.logsumexp(-z / softmin_tau, dim=-1) + softmin_tau * torch.log(count)
+
     has_rival = valid_pair.any(dim=-1)
+    q = hard_min_weight * hard_q + (1.0 - hard_min_weight) * soft_q
+
+    if action_prior is not None:
+        q = q + action_prior.to(q.dtype)
+
     q = q.masked_fill(~has_rival, neg_large_like(q))
-
-    # Invalid actions also get large negative.
     q = q.masked_fill(~action_mask.bool(), neg_large_like(q))
-
     return q, dmat

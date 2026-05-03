@@ -23,6 +23,46 @@ def screening_loss(rival_logits: torch.Tensor, rival_label: torch.Tensor, action
     loss = F.binary_cross_entropy_with_logits(rival_logits, labels, weight=weights, reduction="none")
     return loss[valid].mean()
 
+def pairwise_teacher_ranking_loss(
+    q_scores: torch.Tensor,
+    teacher_cost: torch.Tensor,
+    action_mask: torch.Tensor,
+    margin_scale: float = 0.5,
+    max_pairs: int = 256,
+) -> torch.Tensor:
+    q_scores = q_scores.float()
+    teacher_cost = teacher_cost.float()
+    losses = []
+
+    b, k = q_scores.shape
+    for bi in range(b):
+        valid = torch.where(action_mask[bi].bool())[0]
+        if valid.numel() < 2:
+            continue
+
+        ii, jj = torch.meshgrid(valid, valid, indexing="ij")
+        ii = ii.reshape(-1)
+        jj = jj.reshape(-1)
+        keep = teacher_cost[bi, ii] < teacher_cost[bi, jj]
+        ii = ii[keep]
+        jj = jj[keep]
+
+        if ii.numel() == 0:
+            continue
+
+        if ii.numel() > max_pairs:
+            perm = torch.randperm(ii.numel(), device=q_scores.device)[:max_pairs]
+            ii = ii[perm]
+            jj = jj[perm]
+
+        # better action i should have higher q than worse action j
+        cost_gap = (teacher_cost[bi, jj] - teacher_cost[bi, ii]).clamp_min(0.0)
+        margin = (margin_scale * torch.log1p(cost_gap)).clamp(max=5.0)
+        losses.append(torch.relu(margin - (q_scores[bi, ii] - q_scores[bi, jj])).mean())
+
+    if not losses:
+        return q_scores.sum() * 0.0
+    return torch.stack(losses).mean()
 
 def evidence_loss(pred_signed: torch.Tensor, target_signed: torch.Tensor, active_mask: torch.Tensor,
                   evidence_mask: torch.Tensor, action_mask: torch.Tensor, pair_mask: torch.Tensor | None = None,
@@ -91,8 +131,20 @@ def compute_total_loss(outputs: dict, batch: dict, pair_mask: torch.Tensor, q_sc
                           weights.get("huber_delta", 1.0), bool(weights.get("loss_on_all_pairs", False)))
     l_act = action_identity_loss(q_scores, batch["oracle_action_index"], batch["action_mask"], weights.get("tau_q", 1.0))
     l_hn = hard_negative_loss(q_scores, batch["oracle_action_index"], batch["action_mask"], weights.get("action_margin", 0.5))
-    total = (weights.get("lambda_scr", 1.0) * l_scr + weights.get("lambda_evi", 1.0) * l_evi +
-             weights.get("lambda_act", 1.0) * l_act + weights.get("lambda_hn", 0.5) * l_hn)
+    l_rank = pairwise_teacher_ranking_loss(
+        q_scores,
+        batch["teacher_cost"],
+        batch["action_mask"],
+        weights.get("teacher_rank_margin_scale", 0.5),
+        weights.get("teacher_rank_max_pairs", 256),
+    )
+    total = (
+            weights.get("lambda_scr", 1.0) * l_scr
+            + weights.get("lambda_evi", 1.0) * l_evi
+            + weights.get("lambda_act", 1.0) * l_act
+            + weights.get("lambda_hn", 0.5) * l_hn
+            + weights.get("lambda_rank", 1.0) * l_rank
+    )
     logs = {"loss": total.detach(), "loss_scr": l_scr.detach(), "loss_evi": l_evi.detach(),
-            "loss_act": l_act.detach(), "loss_hn": l_hn.detach()}
+            "loss_act": l_act.detach(), "loss_hn": l_hn.detach(), "loss_rank": l_rank.detach()}
     return total, logs

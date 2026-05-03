@@ -300,6 +300,8 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             actions = batch["actions"][0].cpu().numpy()
             action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
 
+            qual = batch_action_quality(actions, action_mask, self.cfg.dt)
+
             rerank_reason = "model_argmax"
             raw_idx = idx
             min_progress = None
@@ -308,7 +310,6 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             # Optional deployment rerank: keep DPIES q as the base score, but avoid
             # low-progress or uncomfortable trajectories when q is close.
             if self.cfg.progress_rerank_weight != 0.0 or self.cfg.comfort_rerank_penalty != 0.0:
-                qual = batch_action_quality(actions, action_mask, self.cfg.dt)
                 q0 = q[0].clone()
                 valid = batch["action_mask"][0].bool()
 
@@ -376,19 +377,7 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "rerank_reason": rerank_reason,
                     "min_progress": None if min_progress is None else float(min_progress),
                     "selected_comfort_violation": selected_comfort,
-                    "selected_rerank_score": selected_rerank_score,
-                    "all_progress_min": float(np.min(qual["progress"][action_mask])),
-                    "all_progress_p50": float(np.percentile(qual["progress"][action_mask], 50)),
-                    "all_progress_max": float(np.max(qual["progress"][action_mask])),
-                    "all_final_speed_p50": float(np.percentile(qual["final_speed"][action_mask], 50)),
-                    "all_final_speed_max": float(np.max(qual["final_speed"][action_mask])),
-                    "all_comfort_violation_sum": int(np.sum(qual["comfort_violation"][action_mask])),
-                    "selected_max_abs_accel": float(qual["max_abs_accel"][idx]),
-                    "selected_max_abs_jerk": float(qual["max_abs_jerk"][idx]),
-                    "selected_max_abs_yaw_rate": float(qual["max_abs_yaw_rate"][idx]),
-                    "selected_max_abs_yaw_accel": float(qual["max_abs_yaw_accel"][idx]),
-                    "selected_terminal_lateral": float(batch["action_meta"][0, idx, 2].item()),
-                    "selected_meta_progress": float(batch["action_meta"][0, idx, 3].item()),
+                    "selected_rerank_score": selected_rerank_score
                 }, ensure_ascii=False) + "\n")
                 fh.flush()
 
