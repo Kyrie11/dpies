@@ -148,6 +148,7 @@ class TeacherEvaluator:
         abs_low_progress_cost = move_gate * abs_low_progress_cost
         target_speed_cost = move_gate * target_speed_cost
 
+        should_move = expert_progress > 10.0 or expert_final_speed > 1.5
         stop_when_should_move_cost = should_move * np.maximum(1.0 - final_speed, 0.0) ** 2
 
         global_without_local = (
