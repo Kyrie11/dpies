@@ -60,7 +60,16 @@ def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: flo
         metrics["screen_recall_at_m"] = screening_recall_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["screen_precision_at_m"] = screening_precision_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["decisive_rival_miss_rate"] = decisive_rival_miss_rate(pair_mask, batch["rival_label"], batch["oracle_action_index"], batch["action_mask"])
-        metrics.update(evidence_prediction_metrics(out["signed_evidence"], batch["signed_evidence_label"], batch["signed_evidence_mask"], batch["evidence_mask"], batch["action_mask"]))
+        metrics.update(
+            evidence_prediction_metrics(
+            out["signed_evidence"],
+            batch["signed_evidence_label"],
+            batch["signed_evidence_mask"],
+            batch["evidence_mask"],
+            batch["action_mask"],
+            pair_mask = pair_mask,
+                    )
+        )
         metrics["selected_count"] = float(selected.float().sum(dim=1).mean().item())
         bs = int(batch["actions"].shape[0])
         count += bs

@@ -81,7 +81,7 @@ class DPIESPlannerCore:
         self.hard_min_weight = float(hard_min_weight)
 
     @torch.no_grad()
-    def choose_action(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
+    def choose_action(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dev_batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
         out = self.model(dev_batch)
         pair_mask = make_directed_pair_mask(out["rival_scores"], dev_batch["action_mask"], self.top_m)
@@ -97,7 +97,7 @@ class DPIESPlannerCore:
             hard_min_weight=self.hard_min_weight,
         )
         pred = q.masked_fill(~dev_batch["action_mask"].bool(), -1e9).argmax(dim=-1)
-        return pred.detach().cpu(), q.detach().cpu(), selected, pair_mask.detach().cpu()
+        return (pred.detach().cpu(), q.detach().cpu(), selected, pair_mask.detach().cpu())
 
 
 class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
@@ -312,8 +312,8 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             pred, q, selected, pair_mask = self.core.choose_action(batch)
             model_select_s = time.perf_counter() - t
             idx = int(pred[0].item())
-            actions = batch["actions"][0].cpu().numpy()
-            action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
+            actions = batch["actions"][0].detach().cpu().numpy()
+            action_mask = batch["action_mask"][0].detach().cpu().numpy().astype(bool)
 
             qual = batch_action_quality(actions, action_mask, self.cfg.dt)
             selected_comfort = float(qual["comfort_violation"][idx]) if idx >= 0 else None
@@ -384,14 +384,13 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
 
             debug_path = Path("runs/closed_loop_action_debug.jsonl")
             debug_path.parent.mkdir(parents=True, exist_ok=True)
-            q_np = q[0].numpy()
-            pair_mask_np = pair_mask[0].numpy()
-            selected_np = selected[0].numpy()
+            q_np = q[0].detach().cpu().numpy()
+            pair_mask_np = pair_mask[0].detach().cpu().numpy()
+            selected_np = selected[0].detach().cpu().numpy()
             order = np.argsort(np.where(action_mask, q_np, -1e9))[::-1][:8]
-            meta_np = batch["action_meta"][0].cpu().numpy()
+            meta_np = batch["action_meta"][0].detach().cpu().numpy()
             with debug_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({
-                    "selected_action": idx,
                     "selected_mode": mode,
                     "selected_progress": progress,
                     "selected_final_speed": final_speed,
@@ -424,8 +423,14 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                 fh.flush()
 
             self.last_debug.update(
-                {"selected_action": idx, "q_selected": float(q[0, idx].item()), "selected_evidence": selected[0],
-                 "input_s": input_s, "model_select_s": model_select_s})
+                {
+                    "selected_action": idx,
+                    "q_selected": float(q[0, idx].item()),
+                    "selected_evidence_count": int(selected_np.sum()),
+                    "input_s": input_s,
+                    "model_select_s": model_select_s,
+                    }
+                )
 
             return self._trajectory_from_action(current_ego, actions[idx])
         except Exception as exc:
