@@ -133,6 +133,11 @@ class TeacherEvaluator:
 
         low_progress_cost = np.maximum(0.75 - progress_ratio, 0.0) ** 2
 
+        expert_final_speed = 0
+        if len(logged_ego_future) >= 2:
+            diffs = np.diff(logged_ego_future[:, :2], axis=0)
+            expert_final_speed = float(np.linalg.norm(diffs[-1]) / max(dt, 1e-3))
+
         absolute_progress_floor = 20.0
         abs_low_progress_cost = np.maximum(absolute_progress_floor - action_progress, 0.0) / absolute_progress_floor
         abs_low_progress_cost = abs_low_progress_cost ** 2
