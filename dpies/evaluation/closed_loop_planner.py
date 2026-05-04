@@ -58,11 +58,14 @@ class DPIESClosedLoopConfig:
     progress_rerank_weight: float = 0.03
     comfort_rerank_penalty: float = 5.0
     selection_policy: str = "model"
+    softmin_tau: float = 2.0
+    hard_min_weight: float = 0.3
 
 
 class DPIESPlannerCore:
     def __init__(self, checkpoint: str | Path, device: str = "cuda", top_m: int = 4,
-                 budget: float = 32, eta_e: float = 0.05, gamma0: float = 1.0):
+                 budget: float = 32, eta_e: float = 0.05, gamma0: float = 1.0,
+                 softmin_tau: float = 2.0, hard_min_weight: float = 0.3):
         self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
         ckpt = torch.load(checkpoint, map_location=self.device)
         cfg = ckpt.get("config", {}).get("model", {}) if isinstance(ckpt, dict) else {}
@@ -74,6 +77,8 @@ class DPIESPlannerCore:
         self.budget = float(budget)
         self.eta_e = float(eta_e)
         self.gamma0 = float(gamma0)
+        self.softmin_tau = float(softmin_tau)
+        self.hard_min_weight = float(hard_min_weight)
 
     @torch.no_grad()
     def choose_action(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
@@ -83,7 +88,14 @@ class DPIESPlannerCore:
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              dev_batch["evidence_mask"], dev_batch["evidence_cost"],
                                              self.budget, self.eta_e, self.gamma0)
-        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, dev_batch["action_mask"])
+        q, _ = compute_q_scores(
+            out["signed_evidence"],
+            selected,
+            pair_mask,
+            dev_batch["action_mask"],
+            softmin_tau=self.softmin_tau,
+            hard_min_weight=self.hard_min_weight,
+        )
         pred = q.masked_fill(~dev_batch["action_mask"].bool(), -1e9).argmax(dim=-1)
         return pred.detach().cpu(), q.detach().cpu(), selected
 
@@ -107,6 +119,8 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             budget=self.cfg.budget,
             eta_e=self.cfg.eta_e,
             gamma0=self.cfg.gamma0,
+            softmin_tau=self.cfg.softmin_tau,
+            hard_min_weight=self.cfg.hard_min_weight,
         )
         self.map_provider = NuPlanMapProvider(None, self.cfg.max_map_polylines, self.cfg.max_map_points)
         self.action_gen = ActionGenerator(ActionGeneratorConfig(
@@ -397,6 +411,8 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "selection_policy": self.cfg.selection_policy,
                     "progress_rerank_weight": float(self.cfg.progress_rerank_weight),
                     "comfort_rerank_penalty": float(self.cfg.comfort_rerank_penalty),
+                    "softmin_tau": float(self.cfg.softmin_tau),
+                    "hard_min_weight": float(self.cfg.hard_min_weight),
                 }, ensure_ascii=False) + "\n")
                 fh.flush()
 

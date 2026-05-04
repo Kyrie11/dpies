@@ -45,7 +45,14 @@ def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: flo
         out['signed_evidence'] = signed.float()
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              batch["evidence_mask"], batch["evidence_cost"], budget, eta_e, gamma0)
-        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"], softmin_tau, hard_min_weight)
+        q, _ = compute_q_scores(
+            out["signed_evidence"],
+            selected,
+            pair_mask,
+            batch["action_mask"],
+            softmin_tau=float(softmin_tau),
+            hard_min_weight=float(hard_min_weight),
+        )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - start
@@ -70,6 +77,8 @@ def main() -> None:
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--output-dir", default=None)
+    p.add_argument("--softmin-tau", type=float, default=None)
+    p.add_argument("--hard-min-weight", type=float, default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
     cfg = load_yaml(args.config)
@@ -79,9 +88,9 @@ def main() -> None:
         cfg["cache_dir"] = args.cache_dir
     if args.output_dir:
         cfg["output_dir"] = args.output_dir
-    if args.softmin_tau:
+    if args.softmin_tau is not None:
         cfg["softmin_tau"] = args.softmin_tau
-    if args.hard_min_weight:
+    if args.hard_min_weight is not None:
         cfg["hard_min_weight"] = args.hard_min_weight
 
     out_dir = ensure_dir(cfg.get("output_dir", "eval"))
