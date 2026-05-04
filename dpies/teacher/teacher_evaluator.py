@@ -9,13 +9,6 @@ from dpies.teacher.local_costs import LocalCostWeights, local_teacher_contributi
 
 @dataclass
 class TeacherWeights:
-    """Weights for the candidate-set hindsight teacher.
-
-    The teacher is deliberately split into a global oracle cost and a local
-    evidence cost.  By default direct future-agent collision/proximity is off
-    because dynamic/conflict evidence already covers the same interaction risk;
-    this avoids double counting and removes an O(K*A*T) preprocessing loop.
-    """
     route_progress: float = -5.0
     speed_limit: float = 5.0
     comfort_accel: float = 1.0
@@ -24,17 +17,17 @@ class TeacherWeights:
     imitation_ade: float = 1.0
     imitation_fde: float = 1.0
     local_evidence: float = 1.0
+
+    # Closed-loop-aware additions
     low_progress: float = 20.0
     stop_when_should_move: float = 15.0
-    future_collision: float = 50.0
-    future_proximity: float = 10.0
     hard_comfort: float = 5.0
 
-    # Optional legacy direct future-agent penalties. Keep disabled in the main
-    # implementation unless running an ablation that intentionally double checks
-    # future-agent distance outside evidence units.
-    future_collision: float = 0.0
-    future_proximity: float = 0.0
+    # Direct future-agent penalties.
+    # 如果你担心和 local evidence double count，可以先设 0；
+    # 如果目标是 closed-loop 安全，建议 v3 teacher 设为 50/10 做一版。
+    future_collision: float = 50.0
+    future_proximity: float = 10.0
     collision_radius_m: float = 2.2
     proximity_sigma_m: float = 3.0
 
@@ -97,6 +90,19 @@ class TeacherEvaluator:
         jerk_cost_all = (np.maximum(np.abs(jerk) - 5.0, 0.0) ** 2).mean(axis=1)
         curv_cost_all = (np.maximum(np.abs(actions[:, :, 5]) - 0.25, 0.0) ** 2).mean(axis=1)
 
+        max_abs_accel = np.max(np.abs(actions[:, :, 4]), axis=1)
+
+        jerk = np.gradient(actions[:, :, 4], dt, axis=1)
+        max_abs_jerk = np.max(np.abs(jerk), axis=1)
+
+        max_abs_curv = np.max(np.abs(actions[:, :, 5]), axis=1)
+
+        hard_comfort_cost = (
+                np.maximum(max_abs_accel - 3.0, 0.0) ** 2
+                + np.maximum(max_abs_jerk - 5.0, 0.0) ** 2
+                + np.maximum(max_abs_curv - 0.25, 0.0) ** 2
+        ).astype(np.float32)
+
         # Optional legacy direct future-agent check. Disabled by default because
         # it duplicates dynamic/conflict local evidence and is often one of the
         # heavier preprocessing loops.
@@ -150,9 +156,8 @@ class TeacherEvaluator:
                 + w.low_progress * low_progress_cost
                 + w.stop_when_should_move * stop_when_should_move_cost
                 + w.hard_comfort * hard_comfort_cost
-                + w.future_collision * future_col
-                + w.future_proximity * future_pro
         )
+
         total = global_without_local + w.local_evidence * local_sum
         costs[valid_idx] = total[valid_idx].astype(np.float32)
         components[:, :] = np.stack([

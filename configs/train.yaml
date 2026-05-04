@@ -21,6 +21,8 @@ selection:
   budget: 32
   eta_e: 0.05
   gamma0: 1.0
+  softmin_tau: 2.0
+  hard_min_weight: 0.3
 loss:
   lambda_scr: 1.0
   lambda_evi: 1.0

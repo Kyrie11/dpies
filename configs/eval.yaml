@@ -7,3 +7,5 @@ eta_e: 0.05
 gamma0: 1.0
 batch_size: 4
 num_workers: 4
+softmin_tau: 2.0
+hard_min_weight: 0.3

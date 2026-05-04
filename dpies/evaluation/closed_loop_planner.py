@@ -302,12 +302,13 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
             action_mask = batch["action_mask"][0].cpu().numpy().astype(bool)
 
             qual = batch_action_quality(actions, action_mask, self.cfg.dt)
+            selected_comfort = float(qual["comfort_violation"][idx]) if idx >= 0 else None
+            selected_rerank_score = None
+            min_progress = None
 
             rerank_reason = "model_argmax"
             raw_idx = idx
-            min_progress = None
-            selected_comfort = None
-            selected_rerank_score = None
+
             # Optional deployment rerank: keep DPIES q as the base score, but avoid
             # low-progress or uncomfortable trajectories when q is close.
             if self.cfg.progress_rerank_weight != 0.0 or self.cfg.comfort_rerank_penalty != 0.0:
@@ -393,6 +394,9 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                     "model_top8_progress": [float(actions[x, -1, 0]) for x in order],
                     "model_top8_final_speed": [float(actions[x, -1, 3]) for x in order],
                     "model_top8_terminal_lateral": [float(meta_np[x, 2]) for x in order],
+                    "selection_policy": self.cfg.selection_policy,
+                    "progress_rerank_weight": float(self.cfg.progress_rerank_weight),
+                    "comfort_rerank_penalty": float(self.cfg.comfort_rerank_penalty),
                 }, ensure_ascii=False) + "\n")
                 fh.flush()
 

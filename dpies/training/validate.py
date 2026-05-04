@@ -64,7 +64,14 @@ def validate(
                                              float(selection_cfg.get("budget", 32)),
                                              float(selection_cfg.get("eta_e", 0.05)),
                                              float(selection_cfg.get("gamma0", 1.0)))
-        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"])
+        q, _ = compute_q_scores(
+            out["signed_evidence"],
+            selected,
+            pair_mask,
+            batch["action_mask"],
+            softmin_tau=float(selection_cfg.get("softmin_tau", 2.0)),
+            hard_min_weight=float(selection_cfg.get("hard_min_weight", 0.3)),
+        )
         metrics = batch_action_metrics(q, batch["oracle_action_index"], batch["teacher_cost"], batch["action_mask"])
         metrics["screen_recall_at_m"] = screening_recall_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["screen_precision_at_m"] = screening_precision_at_m(pair_mask, batch["rival_label"], batch["action_mask"])

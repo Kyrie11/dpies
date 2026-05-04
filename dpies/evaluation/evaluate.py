@@ -31,7 +31,7 @@ from dpies.training.dataset import EvidenceCacheDataset
 
 
 @torch.no_grad()
-def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: float, gamma0: float) -> dict[str, float]:
+def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: float, gamma0: float, softmin_tau, hard_min_weight) -> dict[str, float]:
     sums: dict[str, float] = {}
     count = 0
     elapsed = 0.0
@@ -45,7 +45,7 @@ def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: flo
         out['signed_evidence'] = signed.float()
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              batch["evidence_mask"], batch["evidence_cost"], budget, eta_e, gamma0)
-        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"])
+        q, _ = compute_q_scores(out["signed_evidence"], selected, pair_mask, batch["action_mask"], softmin_tau, hard_min_weight)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - start
@@ -79,6 +79,11 @@ def main() -> None:
         cfg["cache_dir"] = args.cache_dir
     if args.output_dir:
         cfg["output_dir"] = args.output_dir
+    if args.softmin_tau:
+        cfg["softmin_tau"] = args.softmin_tau
+    if args.hard_min_weight:
+        cfg["hard_min_weight"] = args.hard_min_weight
+
     out_dir = ensure_dir(cfg.get("output_dir", "eval"))
     ckpt = torch.load(cfg["checkpoint"], map_location=args.device)
     train_cfg = ckpt.get("config", {})
@@ -91,7 +96,8 @@ def main() -> None:
     rows = []
     for budget in cfg.get("budgets", [32]):
         metrics = evaluate_budget(model, loader, torch.device(args.device), int(cfg.get("top_m", 4)),
-                                  float(budget), float(cfg.get("eta_e", 0.05)), float(cfg.get("gamma0", 1.0)))
+                                  float(budget), float(cfg.get("eta_e", 0.05)), float(cfg.get("gamma0", 1.0)),
+                                  float(cfg.get("softmin_tau")), float(cfg.get("hard_min_weight")))
         row = {"budget": budget, **metrics}
         rows.append(row)
         print(json.dumps(row, indent=2))

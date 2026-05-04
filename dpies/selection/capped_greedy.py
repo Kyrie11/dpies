@@ -115,27 +115,33 @@ def compute_q_scores(
     dmat = (signed * selected_mask[:, :, None, None].to(signed.dtype)).sum(dim=1)
 
     valid_pair = (
-            pair_mask.bool()
-            & action_mask[:, :, None].bool()
-            & action_mask[:, None, :].bool()
+        pair_mask.bool()
+        & action_mask[:, :, None].bool()
+        & action_mask[:, None, :].bool()
     )
 
     neg_large = neg_large_like(dmat)
-    masked = dmat.masked_fill(~valid_pair, float("inf"))
+    pos_large = -neg_large
 
-    hard_q = masked.min(dim=-1).values
+    # hard-min: invalid pair should be +inf
+    hard_masked = dmat.masked_fill(~valid_pair, pos_large)
+    hard_q = hard_masked.min(dim=-1).values
 
-    # soft-min over rivals: less dominated by one noisy pair
-    z = dmat.masked_fill(~valid_pair, neg_large)
+    # soft-min: invalid pair should also be +inf, so exp(-inf/tau)=0
+    soft_masked = dmat.masked_fill(~valid_pair, pos_large)
     count = valid_pair.sum(dim=-1).clamp_min(1).to(dmat.dtype)
-    soft_q = -softmin_tau * torch.logsumexp(-z / softmin_tau, dim=-1) + softmin_tau * torch.log(count)
+
+    tau = max(float(softmin_tau), 1e-6)
+    soft_q = -tau * torch.logsumexp(-soft_masked / tau, dim=-1) + tau * torch.log(count)
 
     has_rival = valid_pair.any(dim=-1)
+
     q = hard_min_weight * hard_q + (1.0 - hard_min_weight) * soft_q
 
     if action_prior is not None:
         q = q + action_prior.to(q.dtype)
 
-    q = q.masked_fill(~has_rival, neg_large_like(q))
-    q = q.masked_fill(~action_mask.bool(), neg_large_like(q))
+    q = q.masked_fill(~has_rival, neg_large)
+    q = q.masked_fill(~action_mask.bool(), neg_large)
+
     return q, dmat

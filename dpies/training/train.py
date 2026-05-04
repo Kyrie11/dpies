@@ -287,6 +287,8 @@ def main() -> None:
                 selected,
                 pair_mask,
                 batch["action_mask"],
+                softmin_tau=float(sel_cfg.get("softmin_tau", 2.0)),
+                hard_min_weight=float(sel_cfg.get("hard_min_weight", 0.3)),
             )
 
             loss, logs = compute_total_loss(out, batch, pair_mask, q, loss_cfg)
