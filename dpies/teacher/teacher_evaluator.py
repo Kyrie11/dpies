@@ -9,23 +9,19 @@ from dpies.teacher.local_costs import LocalCostWeights, local_teacher_contributi
 
 @dataclass
 class TeacherWeights:
-    route_progress: float = -5.0
+    route_progress: float = -8.0
     speed_limit: float = 5.0
     comfort_accel: float = 1.0
     comfort_jerk: float = 0.5
     comfort_curvature: float = 0.5
-    imitation_ade: float = 1.0
-    imitation_fde: float = 1.0
-    local_evidence: float = 1.0
+    imitation_ade: float = 0.5
+    imitation_fde: float = 0.5
+    local_evidence: float = 0.2
 
-    # Closed-loop-aware additions
-    low_progress: float = 20.0
-    stop_when_should_move: float = 15.0
+    low_progress: float = 40.0
+    stop_when_should_move: float = 30.0
     hard_comfort: float = 5.0
 
-    # Direct future-agent penalties.
-    # 如果你担心和 local evidence double count，可以先设 0；
-    # 如果目标是 closed-loop 安全，建议 v3 teacher 设为 50/10 做一版。
     future_collision: float = 50.0
     future_proximity: float = 10.0
     collision_radius_m: float = 2.2
