@@ -58,16 +58,28 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     current = db.ego_state_at_lidar_row(lidar_row)
     if current is None:
         return None
-    hist_global, _ = db.ego_series(center_us, args.history_seconds, 0.0, args.dt)
-    future_global, _ = db.ego_series(center_us, 0.0, args.future_seconds, args.dt)
-    logged_future = ego_series_to_local(future_global[1:], current)
-    ego_history = ego_series_to_local(hist_global, current)
-
-    tokens, current_agents, agent_mask = db.current_agents(lidar_row, current, args.max_agents, args.agent_radius_m)
-    agent_hist_small, agent_hist_mask_small = db.agent_history(center_us, tokens, current, args.history_seconds, args.dt, return_mask=True)
-    agent_future_small, agent_future_mask_small = db.agent_future(center_us, tokens, current, args.future_seconds, args.dt, return_mask=True)
     hist_steps = int(round(args.history_seconds / args.dt)) + 1
     fut_steps = int(round(args.future_seconds / args.dt))
+
+    # Fetch history+future in one pass. This preserves the previous slices:
+    #   ego_history  = offsets [-history, ..., 0]
+    #   logged_future = offsets [dt, ..., future]
+    # but avoids duplicate nearest-lidar and ego-pose lookups at the center.
+    ego_offsets = np.arange(-args.history_seconds, args.future_seconds + 1e-6, args.dt, dtype=np.float32)
+    ego_global, _ = db.ego_series_for_offsets(center_us, ego_offsets)
+    ego_history = ego_series_to_local(ego_global[:hist_steps], current)
+    logged_future = ego_series_to_local(ego_global[hist_steps:], current)
+
+    tokens, current_agents, agent_mask = db.current_agents(lidar_row, current, args.max_agents, args.agent_radius_m)
+    agent_offsets = np.concatenate([
+        np.arange(-args.history_seconds, 1e-6, args.dt, dtype=np.float32),
+        np.arange(args.dt, args.future_seconds + 1e-6, args.dt, dtype=np.float32),
+    ])
+    agent_window_small, agent_window_mask_small = db.agent_series_for_offsets(center_us, tokens, current, agent_offsets)
+    agent_hist_small = agent_window_small[:, :hist_steps]
+    agent_hist_mask_small = agent_window_mask_small[:, :hist_steps]
+    agent_future_small = agent_window_small[:, hist_steps:]
+    agent_future_mask_small = agent_window_mask_small[:, hist_steps:]
     agent_history, agent_history_mask = _pad_agents(agent_hist_small, agent_hist_mask_small, args.max_agents, hist_steps)
     agent_future, agent_future_mask = _pad_agents(agent_future_small, agent_future_mask_small, args.max_agents, fut_steps)
     agent_track_id = np.zeros((args.max_agents,), dtype=np.int64)

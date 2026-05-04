@@ -339,14 +339,32 @@ class NuPlanMapProvider(NullMapProvider):
             ego_xy: np.ndarray,
             radius_m: float,
     ) -> dict[Any, list[Any]]:
-        """Layer-wise map query for official nuPlan v1.1 devkit.
+        """Query proximal map objects with a fast bulk path and safe fallback.
 
-        One unsupported layer should not make the whole local HD map empty.
+        The old implementation called `get_proximal_map_objects` once per layer
+        for every sample. Most nuPlan devkit versions support passing all layers
+        at once, which is much faster. If a particular installation rejects the
+        bulk query, fall back to the previous layer-wise behavior so outputs stay
+        unchanged.
         """
         center = self._Point2D(float(ego_xy[0]), float(ego_xy[1]))
-        objects: dict[Any, list[Any]] = {}
+        layers = self._layer_list()
 
-        for layer in self._layer_list():
+        try:
+            got = map_api.get_proximal_map_objects(center, radius_m, layers)
+            if isinstance(got, dict):
+                objects: dict[Any, list[Any]] = {}
+                for layer in layers:
+                    vals = got.get(layer, None)
+                    if vals is None:
+                        vals = got.get(getattr(layer, "name", str(layer)), [])
+                    objects[layer] = list(vals or [])
+                return objects
+        except Exception as exc:
+            self._warn_once("map_bulk_query", f"Bulk nuPlan map query failed; falling back to layer-wise queries: {exc}")
+
+        objects: dict[Any, list[Any]] = {}
+        for layer in layers:
             lname = getattr(layer, "name", str(layer))
             try:
                 objects[layer] = self._query_map_layer(map_api, center, radius_m, layer)

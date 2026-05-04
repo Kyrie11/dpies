@@ -219,6 +219,19 @@ def _ego_polygons(action: np.ndarray) -> list[Any]:
     return polys
 
 
+def _compile_action_geometry(action: np.ndarray) -> dict[str, Any]:
+    """Cache Shapely geometry that is reused across many map-rule evidence units.
+
+    A single sample can evaluate up to O(128 evidence units * 32 actions). Without
+    this cache, each map rule rebuilt the same ego footprint polygons and
+    action centerline repeatedly.
+    """
+    return {
+        "centerline": _action_centerline(action),
+        "ego_polys": _ego_polygons(action),
+    }
+
+
 def _union_polygons(polys: Sequence[np.ndarray]) -> Any | None:
     if Polygon is None or unary_union is None:
         return None
@@ -255,12 +268,13 @@ def _compile_meta_geometry(meta: dict[str, Any] | None) -> dict[str, Any] | None
     return out
 
 
-def _distance_to_meta_geometry(action: np.ndarray, meta: dict[str, Any] | None, fallback_point: np.ndarray) -> tuple[float, int]:
+def _distance_to_meta_geometry(action: np.ndarray, meta: dict[str, Any] | None, fallback_point: np.ndarray,
+                               action_geometry: dict[str, Any] | None = None) -> tuple[float, int]:
     # Fallback to cheap center distance when shapely geometry is unavailable.
     if LineString is None or Point is None:
         d, idx, _ = pairwise_min_distance(action[:, :2], fallback_point.reshape(1, 2))
         return float(d), int(idx)
-    line = _action_centerline(action)
+    line = (action_geometry or {}).get("centerline") if action_geometry is not None else _action_centerline(action)
     geoms = list((meta or {}).get("__geoms", []))
     if not geoms:
         geoms = []
@@ -288,7 +302,8 @@ def _distance_to_meta_geometry(action: np.ndarray, meta: dict[str, Any] | None, 
         return float(d), int(idx)
 
 
-def _first_interaction_time(action: np.ndarray, meta: dict[str, Any] | None, dt: float) -> float | None:
+def _first_interaction_time(action: np.ndarray, meta: dict[str, Any] | None, dt: float,
+                            action_geometry: dict[str, Any] | None = None) -> float | None:
     if Polygon is None or LineString is None:
         return None
     geoms = list((meta or {}).get("__geoms", []))
@@ -298,14 +313,14 @@ def _first_interaction_time(action: np.ndarray, meta: dict[str, Any] | None, dt:
         geoms = [g for g in (line_geoms + poly_geoms) if g is not None]
     if not geoms:
         return None
-    ego_polys = _ego_polygons(action)
+    ego_polys = (action_geometry or {}).get("ego_polys") if action_geometry is not None else _ego_polygons(action)
     for idx, ep in enumerate(ego_polys):
         try:
             if any(ep.intersects(g) or _safe_distance(ep, g) < 0.25 for g in geoms):
                 return float(idx + 1) * dt
         except Exception:
             continue
-    center = _action_centerline(action)
+    center = (action_geometry or {}).get("centerline") if action_geometry is not None else _action_centerline(action)
     if center is not None:
         try:
             if any(center.intersects(g) or _safe_distance(center, g) < 0.25 for g in geoms):
@@ -317,11 +332,12 @@ def _first_interaction_time(action: np.ndarray, meta: dict[str, Any] | None, dt:
 
 def _map_rule_exact(q: np.ndarray, feature: np.ndarray, action: np.ndarray, dt: float,
                     meta: dict[str, Any] | None = None, route_info: dict[str, Any] | None = None,
-                    use_future_traffic: bool = False) -> None:
+                    use_future_traffic: bool = False,
+                    action_geometry: dict[str, Any] | None = None) -> None:
     rule_code = int(round(float(feature[12]))) if len(feature) > 12 else int(meta.get("rule_code", 0)) if meta else 0
     ex, ey = float(feature[1]), float(feature[2])
     point = np.asarray([ex, ey], dtype=np.float32)
-    min_dist, idx = _distance_to_meta_geometry(action, meta, point)
+    min_dist, idx = _distance_to_meta_geometry(action, meta, point, action_geometry)
     q[0] = min(float(min_dist), 99.0)
     q[1] = float(idx + 1) * dt if idx >= 0 else 99.0
     q[2] = 1.0 if min_dist < 0.25 else q[2]
@@ -331,16 +347,16 @@ def _map_rule_exact(q: np.ndarray, feature: np.ndarray, action: np.ndarray, dt: 
 
     if Polygon is None or LineString is None:
         return
-    ego_polys = _ego_polygons(action)
-    centerline = _action_centerline(action)
+    ego_polys = (action_geometry or {}).get("ego_polys") if action_geometry is not None else _ego_polygons(action)
+    centerline = (action_geometry or {}).get("centerline") if action_geometry is not None else _action_centerline(action)
     polygons = _polygons_from_meta(meta)
     polylines = _polylines_from_meta(meta)
 
     if rule_code == int(MapRuleCode.STOP_LINE):
-        touched = _first_interaction_time(action, meta, dt)
+        touched = _first_interaction_time(action, meta, dt, action_geometry)
         q[17] = 1.0 if touched is not None else q[17]
     elif rule_code == int(MapRuleCode.TRAFFIC_LIGHT_RED):
-        touched_t = _first_interaction_time(action, meta, dt)
+        touched_t = _first_interaction_time(action, meta, dt, action_geometry)
         if touched_t is not None:
             status_now = str((meta or {}).get("traffic_light_status", "UNKNOWN")).upper()
             current_red = "RED" in status_now or status_now.endswith("STOP")
@@ -423,7 +439,8 @@ def query_one(feature: np.ndarray, type_id: int, action: np.ndarray, dt: float =
               metadata: dict[str, Any] | None = None,
               route_info: dict[str, Any] | None = None,
               use_future_traffic: bool = False,
-              exact_map_rules: bool = True) -> np.ndarray:
+              exact_map_rules: bool = True,
+              action_geometry: dict[str, Any] | None = None) -> np.ndarray:
     q = np.zeros((QUERY_DIM,), dtype=np.float32)
     xy = action[:, :2]
     speed = action[:, 3]
@@ -506,7 +523,8 @@ def query_one(feature: np.ndarray, type_id: int, action: np.ndarray, dt: float =
         q[21] = max(0.0, max_speed - 13.4)
         q[22] = max(q[22], max(0.0, -float(action[-1, 0])))
         if exact_map_rules:
-            _map_rule_exact(q, feature, action, dt, metadata, route_info, use_future_traffic=use_future_traffic)
+            _map_rule_exact(q, feature, action, dt, metadata, route_info, use_future_traffic=use_future_traffic,
+                            action_geometry=action_geometry)
     q[23] = 1.0
     return q
 
@@ -521,17 +539,31 @@ def compute_geometry_query(evidence_features: np.ndarray, evidence_type: np.ndar
                            exact_map_rules: bool = True) -> np.ndarray:
     n, k = evidence_features.shape[0], actions.shape[0]
     out = np.zeros((n, k, QUERY_DIM), dtype=np.float32)
+
+    compiled_meta: list[dict[str, Any] | None] = []
+    for i in range(n):
+        meta = evidence_metadata[i] if evidence_metadata is not None and i < len(evidence_metadata) else None
+        compiled_meta.append(_compile_meta_geometry(meta) if evidence_mask[i] else None)
+
+    # Exact map checks reuse the same ego polygons / centerline for a given
+    # action across many map-rule evidence units. Precompute once per action.
+    action_geometries: list[dict[str, Any] | None] = [None] * k
+    if exact_map_rules and (LineString is not None or Polygon is not None):
+        for a in range(k):
+            if action_mask[a]:
+                action_geometries[a] = _compile_action_geometry(actions[a])
+
     for i in range(n):
         if not evidence_mask[i]:
             continue
-        meta = evidence_metadata[i] if evidence_metadata is not None and i < len(evidence_metadata) else None
-        meta = _compile_meta_geometry(meta)
+        meta = compiled_meta[i]
         for a in range(k):
             if not action_mask[a]:
                 continue
             out[i, a] = query_one(evidence_features[i], int(evidence_type[i]), actions[a], dt, future_agents,
                                   future_agent_mask, metadata=meta, route_info=route_info,
-                                  use_future_traffic=use_future_traffic, exact_map_rules=exact_map_rules)
+                                  use_future_traffic=use_future_traffic, exact_map_rules=exact_map_rules,
+                                  action_geometry=action_geometries[a])
     return out
 
 

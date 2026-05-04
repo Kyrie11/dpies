@@ -105,6 +105,16 @@ class NuPlanSQLite:
         self.db_path = Path(db_path)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
+        # Read-heavy preprocessing: keep SQLite temp state in memory and reduce
+        # lock bookkeeping. These PRAGMAs are safe for the normal read-only
+        # path and simply no-op/fall back when unsupported.
+        try:
+            self.conn.execute("PRAGMA query_only=ON")
+            self.conn.execute("PRAGMA temp_store=MEMORY")
+            self.conn.execute("PRAGMA cache_size=-200000")  # about 200 MB page cache per worker
+            self.conn.execute("PRAGMA mmap_size=268435456")  # 256 MB mmap window
+        except Exception:
+            pass
         self._tables: Optional[set[str]] = None
         self._columns: Dict[str, List[str]] = {}
         self._lidar_rows: Optional[List[sqlite3.Row]] = None
@@ -132,6 +142,8 @@ class NuPlanSQLite:
     def create_fast_indexes(self) -> None:
         """Best-effort indexes for writable DB copies. In-memory timestamp caching is used regardless."""
         try:
+            # create indexes needs write access; undo query_only from __init__.
+            self.conn.execute("PRAGMA query_only=OFF")
             token_col, ts_col, _ = self._lidar_pc_base_cols()
             self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_dpies_lidar_pc_ts ON lidar_pc({ts_col})")
             self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_dpies_lidar_pc_token ON lidar_pc({token_col})")
@@ -269,6 +281,15 @@ class NuPlanSQLite:
 
     def ego_series(self, center_us: int, seconds_before: float, seconds_after: float, dt: float) -> Tuple[np.ndarray, np.ndarray]:
         target_offsets = np.arange(-seconds_before, seconds_after + 1e-6, dt, dtype=np.float32)
+        return self.ego_series_for_offsets(center_us, target_offsets)
+
+    def ego_series_for_offsets(self, center_us: int, offsets_s: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Fetch ego poses for arbitrary offsets with one nearest-lidar pass.
+
+        This lets preprocessing request history and future together instead of
+        doing two nearly identical nearest-row / ego-pose lookup loops per sample.
+        """
+        target_offsets = np.asarray(offsets_s, dtype=np.float32)
         target_times = (center_us + target_offsets * 1e6).astype(np.int64)
         rows = [self.nearest_lidar_row(int(t)) for t in target_times]
         states: List[np.ndarray] = []
@@ -369,9 +390,24 @@ class NuPlanSQLite:
 
     def _agent_series(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray,
                       offsets_s: np.ndarray, return_mask: bool = False) -> Tuple[np.ndarray, np.ndarray] | np.ndarray:
-        times = (center_us + offsets_s.astype(np.float32) * 1e6).astype(np.int64)
+        out, mask = self.agent_series_for_offsets(center_us, tokens, ego_state, offsets_s)
+        return (out, mask) if return_mask else out
+
+    def agent_series_for_offsets(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray,
+                                 offsets_s: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Fetch selected agents at arbitrary offsets.
+
+        History and future used to call `_agent_series` separately, which scanned
+        neighboring lidar boxes twice. Calling this once for the combined window
+        preserves the exact arrays after slicing while avoiding duplicate SQL/cache
+        lookups and transforms.
+        """
+        offsets_s = np.asarray(offsets_s, dtype=np.float32)
+        times = (center_us + offsets_s * 1e6).astype(np.int64)
         out = np.zeros((len(tokens), len(times), 8), dtype=np.float32)
         mask = np.zeros((len(tokens), len(times)), dtype=bool)
+        if not tokens or len(times) == 0:
+            return out, mask
         token_keys = {token_to_str(t): i for i, t in enumerate(tokens)}
         ego_xy, ego_yaw = ego_state[:2], float(ego_state[2])
         for h, ts in enumerate(times):
@@ -383,7 +419,7 @@ class NuPlanSQLite:
                 if idx is not None:
                     out[idx, h] = transform_agent_state_global_to_ego(b["state"], ego_xy, ego_yaw)
                     mask[idx, h] = True
-        return (out, mask) if return_mask else out
+        return out, mask
 
     def agent_history(self, center_us: int, tokens: Sequence[Any], ego_state: np.ndarray, history_s: float,
                       dt: float, return_mask: bool = False) -> Tuple[np.ndarray, np.ndarray] | np.ndarray:
