@@ -9,28 +9,26 @@ from dpies.teacher.local_costs import LocalCostWeights, local_teacher_contributi
 
 @dataclass
 class TeacherWeights:
-    route_progress: float = -35.0
+    route_progress: float = -18.0
     speed_limit: float = 5.0
     comfort_accel: float = 1.0
     comfort_jerk: float = 0.5
     comfort_curvature: float = 0.5
-
     imitation_ade: float = 0.25
     imitation_fde: float = 0.25
+    local_evidence: float = 0.08
 
-    local_evidence: float = 0.05
-
-    low_progress: float = 20.0
-    stop_when_should_move: float = 60.0
+    low_progress: float = 80.0
+    stop_when_should_move: float = 80.0
+    target_speed: float = 12.0
+    target_speed_weight: float = 4.0
+    excessive_progress: float = 0.05
     hard_comfort: float = 5.0
 
     future_collision: float = 50.0
     future_proximity: float = 10.0
-
-    absolute_low_progress: float = 80.0
-    progress_floor_m: float = 20.0
-    progress_floor_speed_frac: float = 0.65
-    progress_gate_risk_margin: float = 80.0
+    collision_radius_m: float = 2.2
+    proximity_sigma_m: float = 3.0
 
 
 class TeacherEvaluator:
@@ -135,44 +133,20 @@ class TeacherEvaluator:
 
         low_progress_cost = np.maximum(0.75 - progress_ratio, 0.0) ** 2
 
-        # 如果 log future 明显在走，candidate 却几乎停住，强惩罚
-        expert_final_speed = 0.0
-        if len(logged_ego_future) >= 2:
-            diffs = np.diff(logged_ego_future[:, :2], axis=0)
-            expert_final_speed = float(np.linalg.norm(diffs[-1]) / max(dt, 1e-3))
+        absolute_progress_floor = 20.0
+        abs_low_progress_cost = np.maximum(absolute_progress_floor - action_progress, 0.0) / absolute_progress_floor
+        abs_low_progress_cost = abs_low_progress_cost ** 2
 
-        current_speed_est = float(np.percentile(actions[valid_idx, 0, 3], 80))
-        horizon_s = float(actions.shape[1] * dt)
+        # Target speed prior: prefer moderate speed, not stop and not 22.5m/s.
+        target_speed = float(getattr(w, "target_speed", 12.0))
+        target_speed_cost = ((final_speed - target_speed) / max(target_speed, 1e-3)) ** 2
 
-        risk_gate = (
-                local_sum
-                + 200.0 * future_col
-                + 30.0 * future_prox
-                + 50.0 * (hard_comfort_cost > 0.0).astype(np.float32)
-        )
+        # Do not punish slow speed too hard when future collision/proximity is high.
+        risk_gate = np.clip(future_col + 0.2 * future_prox, 0.0, 1.0)
+        move_gate = 1.0 - risk_gate
 
-        min_risk = float(np.min(risk_gate[valid_idx]))
-
-        safe_move_exists = bool(np.any(
-            action_mask
-            & (action_progress >= w.progress_floor_m)
-            & (risk_gate <= min_risk + w.progress_gate_risk_margin)
-        ))
-
-        log_should_move = bool(expert_progress > 10.0 or expert_final_speed > 1.5)
-        should_move = float(log_should_move or safe_move_exists)
-
-        desired_progress = max(
-            w.progress_floor_m,
-            w.progress_floor_speed_frac * current_speed_est * horizon_s,
-            0.75 * expert_progress,
-        )
-        desired_progress = min(desired_progress, 60.0)
-
-        absolute_low_progress_cost = should_move * (
-                np.maximum(desired_progress - action_progress, 0.0)
-                / max(desired_progress, 1.0)
-        ) ** 2
+        abs_low_progress_cost = move_gate * abs_low_progress_cost
+        target_speed_cost = move_gate * target_speed_cost
 
         stop_when_should_move_cost = should_move * np.maximum(1.0 - final_speed, 0.0) ** 2
 
@@ -188,8 +162,8 @@ class TeacherEvaluator:
                 + w.future_proximity * future_prox
                 + w.low_progress * low_progress_cost
                 + w.stop_when_should_move * stop_when_should_move_cost
+                + w.target_speed_weight * target_speed_cost
                 + w.hard_comfort * hard_comfort_cost
-                + w.absolute_low_progress * absolute_low_progress_cost
         )
 
         total = global_without_local + w.local_evidence * local_sum
