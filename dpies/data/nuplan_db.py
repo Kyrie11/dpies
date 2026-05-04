@@ -118,6 +118,7 @@ class NuPlanSQLite:
         self._ego_pose_cache: Dict[str, Optional[sqlite3.Row]] = {}
         self._route_cache: Dict[str, List[str]] = {}
         self._traffic_light_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._log_metadata_cache: Optional[Dict[str, Any]] = None
 
     def close(self) -> None:
         self.conn.close()
@@ -491,6 +492,9 @@ class NuPlanSQLite:
         return out
 
     def get_log_metadata(self) -> Dict[str, Any]:
+        if self._log_metadata_cache is not None:
+            return dict(self._log_metadata_cache)
+
         meta: Dict[str, Any] = {"db_path": str(self.db_path), "db_name": self.db_path.name}
 
         if self.has_table("log"):
@@ -531,4 +535,5 @@ class NuPlanSQLite:
         meta["raw_map_name"] = raw_map_name
         meta["map_name"] = canonical_nuplan_map_name(raw_map_name, raw_context)
 
-        return meta
+        self._log_metadata_cache = dict(meta)
+        return dict(meta)

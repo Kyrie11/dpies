@@ -232,21 +232,46 @@ def _union_polygons(polys: Sequence[np.ndarray]) -> Any | None:
         return None
 
 
+def _compile_meta_geometry(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a shallow metadata copy with cached Shapely objects.
+
+    This is intentionally not written back into evidence_metadata_json; it only
+    avoids rebuilding identical LineString/Polygon objects for every action.
+    """
+    if not meta or LineString is None or Point is None:
+        return meta
+    out = dict(meta)
+    line_geoms = [_make_line(x) for x in _polylines_from_meta(meta)]
+    poly_geoms = [_make_polygon(x) for x in _polygons_from_meta(meta)]
+    line_geoms = [g for g in line_geoms if g is not None]
+    poly_geoms = [g for g in poly_geoms if g is not None]
+    out["__line_geoms"] = line_geoms
+    out["__poly_geoms"] = poly_geoms
+    out["__geoms"] = line_geoms + poly_geoms
+    try:
+        out["__polygon_union"] = unary_union(poly_geoms) if poly_geoms and unary_union is not None else None
+    except Exception:
+        out["__polygon_union"] = None
+    return out
+
+
 def _distance_to_meta_geometry(action: np.ndarray, meta: dict[str, Any] | None, fallback_point: np.ndarray) -> tuple[float, int]:
     # Fallback to cheap center distance when shapely geometry is unavailable.
     if LineString is None or Point is None:
         d, idx, _ = pairwise_min_distance(action[:, :2], fallback_point.reshape(1, 2))
         return float(d), int(idx)
     line = _action_centerline(action)
-    geoms = []
-    for pts in _polylines_from_meta(meta):
-        g = _make_line(pts)
-        if g is not None:
-            geoms.append(g)
-    for pts in _polygons_from_meta(meta):
-        g = _make_polygon(pts)
-        if g is not None:
-            geoms.append(g)
+    geoms = list((meta or {}).get("__geoms", []))
+    if not geoms:
+        geoms = []
+        for pts in _polylines_from_meta(meta):
+            g = _make_line(pts)
+            if g is not None:
+                geoms.append(g)
+        for pts in _polygons_from_meta(meta):
+            g = _make_polygon(pts)
+            if g is not None:
+                geoms.append(g)
     if not geoms or line is None:
         d, idx, _ = pairwise_min_distance(action[:, :2], fallback_point.reshape(1, 2))
         return float(d), int(idx)
@@ -266,9 +291,11 @@ def _distance_to_meta_geometry(action: np.ndarray, meta: dict[str, Any] | None, 
 def _first_interaction_time(action: np.ndarray, meta: dict[str, Any] | None, dt: float) -> float | None:
     if Polygon is None or LineString is None:
         return None
-    line_geoms = [_make_line(x) for x in _polylines_from_meta(meta)]
-    poly_geoms = [_make_polygon(x) for x in _polygons_from_meta(meta)]
-    geoms = [g for g in (line_geoms + poly_geoms) if g is not None]
+    geoms = list((meta or {}).get("__geoms", []))
+    if not geoms:
+        line_geoms = [_make_line(x) for x in _polylines_from_meta(meta)]
+        poly_geoms = [_make_polygon(x) for x in _polygons_from_meta(meta)]
+        geoms = [g for g in (line_geoms + poly_geoms) if g is not None]
     if not geoms:
         return None
     ego_polys = _ego_polygons(action)
@@ -328,7 +355,7 @@ def _map_rule_exact(q: np.ndarray, feature: np.ndarray, action: np.ndarray, dt: 
     elif rule_code == int(MapRuleCode.CROSSWALK):
         max_area = 0.0
         if polygons:
-            cross = _union_polygons(polygons)
+            cross = (meta or {}).get("__polygon_union") or _union_polygons(polygons)
             if cross is not None:
                 for ep in ego_polys:
                     try:
@@ -342,7 +369,7 @@ def _map_rule_exact(q: np.ndarray, feature: np.ndarray, action: np.ndarray, dt: 
                     max_area = max(max_area, 1.0)
         q[18] = max(q[18], max_area)
     elif rule_code == int(MapRuleCode.DRIVABLE_AREA):
-        drv = _union_polygons(polygons)
+        drv = (meta or {}).get("__polygon_union") or _union_polygons(polygons)
         if drv is not None and ego_polys:
             outside = 0.0
             for ep in ego_polys:
@@ -377,7 +404,9 @@ def _map_rule_exact(q: np.ndarray, feature: np.ndarray, action: np.ndarray, dt: 
                 route_polys = [np.asarray(p, dtype=np.float32) for p in route_info.get("route_polygons", [])]
             except Exception:
                 route_polys = []
-        route_union = _union_polygons(route_polys)
+        route_union = (meta or {}).get("__polygon_union") if route_polys is polygons else None
+        if route_union is None:
+            route_union = _union_polygons(route_polys)
         if route_union is not None and ego_polys:
             outside = 0.0
             for ep in ego_polys:
@@ -496,6 +525,7 @@ def compute_geometry_query(evidence_features: np.ndarray, evidence_type: np.ndar
         if not evidence_mask[i]:
             continue
         meta = evidence_metadata[i] if evidence_metadata is not None and i < len(evidence_metadata) else None
+        meta = _compile_meta_geometry(meta)
         for a in range(k):
             if not action_mask[a]:
                 continue

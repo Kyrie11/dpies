@@ -70,6 +70,10 @@ class NuPlanMapProvider(NullMapProvider):
         self.map_root = Path(map_root) if map_root else None
         self.map_version = map_version
         self._apis: Dict[str, Any] = {}
+        # Per-worker cache for expensive nuPlan map-object introspection.
+        # Adjacent samples query many of the same map objects; cache global
+        # geometry/metadata and only re-transform to ego frame per sample.
+        self._geometry_cache: Dict[tuple[str, str], tuple[str, Optional[np.ndarray], str | None, float | None]] = {}
         self._warned: set[str] = set()
         self.available = False
         self._init_error = ""
@@ -313,6 +317,22 @@ class NuPlanMapProvider(NullMapProvider):
 
 
 
+    def _cached_object_geometry(self, layer: str, obj: Any, obj_id: str) -> tuple[str, Optional[np.ndarray], str | None, float | None]:
+        key = (str(layer), str(obj_id))
+        cached = self._geometry_cache.get(key)
+        if cached is not None:
+            return cached
+
+        roadblock_id = self._roadblock_id(obj)
+        speed_limit = self._speed_limit(obj)
+        kind, xy_global = self._geometry_from_obj(obj, layer)
+        if xy_global is not None:
+            xy_global = xy_global.astype(np.float32, copy=False)
+        cached = (kind, xy_global, roadblock_id, speed_limit)
+        self._geometry_cache[key] = cached
+        return cached
+
+
     def _safe_get_proximal_map_objects(
             self,
             map_api: Any,
@@ -481,9 +501,8 @@ class NuPlanMapProvider(NullMapProvider):
 
             for layer, obj in iterable:
                 obj_id = self._obj_id(obj)
-                roadblock_id = self._roadblock_id(obj)
+                kind, xy_global, roadblock_id, speed_limit = self._cached_object_geometry(layer, obj, obj_id)
                 is_route = bool(route_ids and (obj_id in route_ids or (roadblock_id is not None and roadblock_id in route_ids)))
-                kind, xy_global = self._geometry_from_obj(obj, layer)
                 if xy_global is None or len(xy_global) < 2:
                     continue
 
@@ -498,7 +517,6 @@ class NuPlanMapProvider(NullMapProvider):
                 keep = self._downsample_points(xy_e_full, self.max_points)
 
                 code = self._rule_code(layer, obj)
-                speed_limit = self._speed_limit(obj)
                 layer_upper = layer.upper()
 
                 # Synthesize drivable area from polygon-backed map objects.

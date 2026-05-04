@@ -291,7 +291,7 @@ geometry_query
 teacher_cost, teacher_components, local_cost_sum
 oracle_action_index, rival_label
 signed_evidence_label, signed_evidence_mask
-logged_ego_future
+logged_ego_future[nuplan_speedup.patch](../../Download/nuplan_speedup.patch)
 ego_to_global                       # x,y,yaw at planning time
 metadata_json, evidence_metadata_json, route_info_json, traffic_lights_json
 ```
