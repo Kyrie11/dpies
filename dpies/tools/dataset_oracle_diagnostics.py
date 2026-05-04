@@ -5,17 +5,19 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-cache = Path(os.environ.get("CACHE_DIR", ""))
+parser = argparse.ArgumentParser(description='Dataset oracle diagnostics')
+parser.add_argument('--CACHE_DIR', type=str, required=True,
+                   help='Path to the cache directory containing npz files')
+args = parser.parse_args()
+
+# 使用命令行参数中的 CACHE_DIR
+cache = Path(args.CACHE_DIR)
 if not cache.exists():
     raise FileNotFoundError(f"CACHE_DIR not found: {cache}")
 
 files = sorted(cache.rglob("*.npz"))
 print("CACHE_DIR:", cache)
 print("num npz:", len(files))
-
-if len(files) == 0:
-    print("No npz files found. Check CACHE_DIR.")
-    raise SystemExit(0)
 
 # Inspect first few files
 print("\nFIRST FILE KEYS")
