@@ -9,23 +9,28 @@ from dpies.teacher.local_costs import LocalCostWeights, local_teacher_contributi
 
 @dataclass
 class TeacherWeights:
-    route_progress: float = -8.0
+    route_progress: float = -35.0
     speed_limit: float = 5.0
     comfort_accel: float = 1.0
     comfort_jerk: float = 0.5
     comfort_curvature: float = 0.5
-    imitation_ade: float = 0.5
-    imitation_fde: float = 0.5
-    local_evidence: float = 0.2
 
-    low_progress: float = 40.0
-    stop_when_should_move: float = 30.0
+    imitation_ade: float = 0.25
+    imitation_fde: float = 0.25
+
+    local_evidence: float = 0.05
+
+    low_progress: float = 20.0
+    stop_when_should_move: float = 60.0
     hard_comfort: float = 5.0
 
     future_collision: float = 50.0
     future_proximity: float = 10.0
-    collision_radius_m: float = 2.2
-    proximity_sigma_m: float = 3.0
+
+    absolute_low_progress: float = 80.0
+    progress_floor_m: float = 20.0
+    progress_floor_speed_frac: float = 0.65
+    progress_gate_risk_margin: float = 80.0
 
 
 class TeacherEvaluator:
@@ -136,7 +141,39 @@ class TeacherEvaluator:
             diffs = np.diff(logged_ego_future[:, :2], axis=0)
             expert_final_speed = float(np.linalg.norm(diffs[-1]) / max(dt, 1e-3))
 
-        should_move = float(expert_progress > 10.0 or expert_final_speed > 1.5)
+        current_speed_est = float(np.percentile(actions[valid_idx, 0, 3], 80))
+        horizon_s = float(actions.shape[1] * dt)
+
+        risk_gate = (
+                local_sum
+                + 200.0 * future_col
+                + 30.0 * future_prox
+                + 50.0 * (hard_comfort_cost > 0.0).astype(np.float32)
+        )
+
+        min_risk = float(np.min(risk_gate[valid_idx]))
+
+        safe_move_exists = bool(np.any(
+            action_mask
+            & (action_progress >= w.progress_floor_m)
+            & (risk_gate <= min_risk + w.progress_gate_risk_margin)
+        ))
+
+        log_should_move = bool(expert_progress > 10.0 or expert_final_speed > 1.5)
+        should_move = float(log_should_move or safe_move_exists)
+
+        desired_progress = max(
+            w.progress_floor_m,
+            w.progress_floor_speed_frac * current_speed_est * horizon_s,
+            0.75 * expert_progress,
+        )
+        desired_progress = min(desired_progress, 60.0)
+
+        absolute_low_progress_cost = should_move * (
+                np.maximum(desired_progress - action_progress, 0.0)
+                / max(desired_progress, 1.0)
+        ) ** 2
+
         stop_when_should_move_cost = should_move * np.maximum(1.0 - final_speed, 0.0) ** 2
 
         global_without_local = (
@@ -152,6 +189,7 @@ class TeacherEvaluator:
                 + w.low_progress * low_progress_cost
                 + w.stop_when_should_move * stop_when_should_move_cost
                 + w.hard_comfort * hard_comfort_cost
+                + w.absolute_low_progress * absolute_low_progress_cost
         )
 
         total = global_without_local + w.local_evidence * local_sum
