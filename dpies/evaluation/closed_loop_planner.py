@@ -57,6 +57,7 @@ class DPIESClosedLoopConfig:
     enable_timing_debug: bool = True
     progress_rerank_weight: float = 0.03
     comfort_rerank_penalty: float = 5.0
+    selection_policy: str = "model"
 
 
 class DPIESPlannerCore:
@@ -355,6 +356,11 @@ class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]
                 idx = int(score.argmax().item())
                 selected_comfort = float(comfort[idx].item())
                 selected_rerank_score = float(score[idx].item())
+            if self.cfg.selection_policy == "progress":
+                score = torch.as_tensor(qual["progress"], dtype=q[0].dtype)
+                score = score.masked_fill(~batch["action_mask"][0].bool(), -1e9)
+                idx = int(score.argmax().item())
+                rerank_reason = "progress_baseline"
             if idx < 0 or idx >= actions.shape[0] or not action_mask[idx]:
                 raise RuntimeError(f"invalid DPIES selected action index {idx}")
             mode = int(batch["action_meta"][0, idx, 0].item())
