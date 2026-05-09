@@ -33,11 +33,12 @@ for p in files[:3]:
 rows = []
 bad = []
 
-component_names_12 = [
+component_names = [
     "ade", "fde", "progress_norm", "speed_over",
     "accel_cost", "jerk_cost", "curv_cost",
-    "future_collision", "future_proximity",
-    "local_sum", "global_without_local", "total",
+    "future_collision", "future_proximity", "local_sum",
+    "rel_low_progress", "abs_low_progress", "speed_floor", "target_speed", "excessive_progress",
+    "move_gate", "global_without_local", "total",
 ]
 
 for idx, p in enumerate(files):
@@ -129,9 +130,9 @@ for idx, p in enumerate(files):
         if "teacher_components" in d:
             comp = d["teacher_components"]
             if comp.ndim == 2 and comp.shape[0] > oracle:
-                for j in range(min(comp.shape[1], len(component_names_12))):
-                    row[f"oracle_comp_{component_names_12[j]}"] = float(comp[oracle, j])
-                    row[f"maxprog_comp_{component_names_12[j]}"] = float(comp[max_progress_idx, j])
+                for j in range(min(comp.shape[1], len(component_names))):
+                    row[f"oracle_comp_{component_names[j]}"] = float(comp[oracle, j])
+                    row[f"maxprog_comp_{component_names[j]}"] = float(comp[max_progress_idx, j])
 
         rows.append(row)
 
@@ -206,6 +207,25 @@ sus = df[
     & (df["max_progress"] >= 20.0)
 ].copy()
 print("\nSUSPECT: oracle near stop while max_progress>=20:", len(sus), "/", len(df))
+if len(df):
+    print("\nTEACHER SANITY TARGETS")
+    targets = {
+        "oracle_progress_mean_gt_30": float(df["oracle_progress"].mean() > 30.0),
+        "oracle_progress_median_gt_20": float(df["oracle_progress"].median() > 20.0),
+        "oracle_low_progress_20m_lt_0.35": float(df["oracle_low_progress_20m"].mean() < 0.35),
+        "oracle_is_near_stop_lt_0.10": float(df["oracle_is_near_stop"].mean() < 0.10),
+        "max_progress_minus_oracle_mean_lt_30": float(df["max_progress_minus_oracle"].mean() < 30.0),
+    }
+    if "oracle_rival_out" in df.columns:
+        targets["oracle_rival_out_mean_gt_20"] = float(df["oracle_rival_out"].mean() > 20.0)
+    if "oracle_comp_future_collision" in df.columns:
+        targets["future_collision_nonzero_or_present"] = float(df["oracle_comp_future_collision"].mean() >= 0.0)
+    if "oracle_comp_future_proximity" in df.columns:
+        targets["future_proximity_mean_gt_0"] = float(df["oracle_comp_future_proximity"].mean() > 0.0)
+    for k, v in targets.items():
+        print(f"{k}: {'PASS' if v else 'FAIL'}")
+    print("overall:", "PASS" if all(bool(v) for v in targets.values()) else "FAIL")
+
 if len(sus):
     show_cols = [
         "file", "oracle", "oracle_mode", "oracle_progress", "oracle_final_speed",

@@ -18,17 +18,28 @@ class TeacherWeights:
     imitation_fde: float = 0.25
     local_evidence: float = 0.08
 
-    low_progress: float = 80.0
-    stop_when_should_move: float = 80.0
-    target_speed: float = 12.0
-    target_speed_weight: float = 4.0
-    excessive_progress: float = 0.05
-    hard_comfort: float = 5.0
+    # Relative imitation/progress still matters, but should not be the only
+    # signal deciding whether the oracle creeps or moves.
+    low_progress: float = 30.0
+    stop_when_should_move: float = 120.0
 
-    future_collision: float = 50.0
-    future_proximity: float = 10.0
+    # Absolute motion priors.  These are gated by per-action future risk so
+    # they discourage unnecessary stop/creep without forcing blind rushing.
+    absolute_progress_floor: float = 22.0
+    absolute_progress_weight: float = 120.0
+    speed_floor: float = 2.5
+    speed_floor_weight: float = 18.0
+    target_speed: float = 7.0
+    target_speed_weight: float = 2.0
+    excessive_progress_cap: float = 70.0
+    excessive_progress: float = 8.0
+    hard_comfort: float = 8.0
+
+    future_collision: float = 60.0
+    future_proximity: float = 8.0
     collision_radius_m: float = 2.2
     proximity_sigma_m: float = 3.0
+    risk_gate_proximity_scale: float = 0.05
 
 
 class TeacherEvaluator:
@@ -55,10 +66,12 @@ class TeacherEvaluator:
         dt = float(self.dt if dt is None else dt)
         k = actions.shape[0]
         costs = np.full((k,), 1e6, dtype=np.float32)
-        # columns: imitation_ade, imitation_fde, progress_reward, speed, accel,
-        # jerk, curvature, future_collision, future_proximity, local_sum,
-        # global_without_local, total
-        components = np.zeros((k, 12), dtype=np.float32)
+        # columns:
+        # ade, fde, progress_norm, speed_over, accel, jerk, curvature,
+        # future_collision, future_proximity, local_sum,
+        # rel_low_progress, abs_low_progress, speed_floor, target_speed, excessive_progress,
+        # move_gate, global_without_local, total
+        components = np.zeros((k, 18), dtype=np.float32)
 
         if local_cost is None:
             local_cost = local_teacher_contribution(
@@ -130,31 +143,56 @@ class TeacherEvaluator:
         final_speed = actions[:, -1, 3]
 
         progress_ratio = action_progress / max(expert_progress, 1e-3)
-
         low_progress_cost = np.maximum(0.75 - progress_ratio, 0.0) ** 2
 
-        expert_final_speed = 0
+        expert_final_speed = 0.0
         if len(logged_ego_future) >= 2:
             diffs = np.diff(logged_ego_future[:, :2], axis=0)
             expert_final_speed = float(np.linalg.norm(diffs[-1]) / max(dt, 1e-3))
 
-        absolute_progress_floor = 20.0
-        abs_low_progress_cost = np.maximum(absolute_progress_floor - action_progress, 0.0) / absolute_progress_floor
+        valid_progress = action_progress[valid_idx]
+        max_valid_progress = float(np.max(valid_progress)) if len(valid_progress) else 0.0
+
+        # Do not use the logged future alone to decide whether the ego should move:
+        # nuPlan logs often contain slow/creep segments, and blindly imitating them
+        # creates a stop-biased oracle.  If the candidate set contains reasonable
+        # motion, low-progress candidates should pay a cost unless that candidate
+        # itself has high future risk.
+        candidate_has_move = max_valid_progress >= 25.0
+        expert_suggests_move = expert_progress > 6.0 or expert_final_speed > 1.0
+        should_move = float(candidate_has_move and (expert_suggests_move or max_valid_progress >= 35.0))
+
+        # Adaptive floor: require moderate progress, but cap the floor so that the
+        # teacher does not chase the very aggressive 120m/180m actions.
+        base_floor = float(getattr(w, "absolute_progress_floor", 22.0))
+        adaptive_floor = min(35.0, max(base_floor, 0.45 * max_valid_progress))
+        abs_low_progress_cost = np.maximum(adaptive_floor - action_progress, 0.0) / max(adaptive_floor, 1e-3)
         abs_low_progress_cost = abs_low_progress_cost ** 2
 
-        # Target speed prior: prefer moderate speed, not stop and not 22.5m/s.
-        target_speed = float(getattr(w, "target_speed", 12.0))
-        target_speed_cost = ((final_speed - target_speed) / max(target_speed, 1e-3)) ** 2
-
-        # Do not punish slow speed too hard when future collision/proximity is high.
-        risk_gate = np.clip(future_col + 0.2 * future_prox, 0.0, 1.0)
-        move_gate = 1.0 - risk_gate
-
+        # Per-action risk gate.  Collision can fully suppress the move prior;
+        # proximity only weakly suppresses it, otherwise "there is a nearby car"
+        # makes the oracle creep in dense but normal traffic.
+        risk_gate = np.clip(
+            future_col + float(getattr(w, "risk_gate_proximity_scale", 0.05)) * future_prox,
+            0.0,
+            1.0,
+        )
+        move_gate = should_move * (1.0 - risk_gate)
         abs_low_progress_cost = move_gate * abs_low_progress_cost
-        target_speed_cost = move_gate * target_speed_cost
 
-        should_move = expert_progress > 10.0 or expert_final_speed > 1.5
-        stop_when_should_move_cost = should_move * np.maximum(1.0 - final_speed, 0.0) ** 2
+        # Speed floor discourages stopping when movement is available.  The target
+        # speed term is intentionally weak and centered at a city-driving speed;
+        # hard comfort/speed-limit terms handle the over-aggressive actions.
+        speed_floor = float(getattr(w, "speed_floor", 2.5))
+        speed_floor_cost = move_gate * (np.maximum(speed_floor - final_speed, 0.0) / max(speed_floor, 1e-3)) ** 2
+
+        target_speed = float(getattr(w, "target_speed", 7.0))
+        target_speed_cost = move_gate * ((final_speed - target_speed) / max(target_speed, 1e-3)) ** 2
+
+        excessive_progress_cap = float(getattr(w, "excessive_progress_cap", 70.0))
+        excessive_progress_cost = (np.maximum(action_progress - excessive_progress_cap, 0.0) / max(excessive_progress_cap, 1e-3)) ** 2
+
+        stop_when_should_move_cost = move_gate * np.maximum(1.0 - final_speed, 0.0) ** 2
 
         global_without_local = (
                 w.imitation_ade * ade_all
@@ -167,10 +205,12 @@ class TeacherEvaluator:
                 + w.future_collision * future_col
                 + w.future_proximity * future_prox
                 + w.low_progress * low_progress_cost
+                + w.absolute_progress_weight * abs_low_progress_cost
+                + w.speed_floor_weight * speed_floor_cost
                 + w.stop_when_should_move * stop_when_should_move_cost
                 + w.target_speed_weight * target_speed_cost
+                + w.excessive_progress * excessive_progress_cost
                 + w.hard_comfort * hard_comfort_cost
-                + w.low_progress * abs_low_progress_cost
         )
 
         total = global_without_local + w.local_evidence * local_sum
@@ -178,6 +218,7 @@ class TeacherEvaluator:
         components[:, :] = np.stack([
             ade_all, fde_all, progress_all, speed_over_all, accel_cost_all,
             jerk_cost_all, curv_cost_all, future_col, future_prox, local_sum,
-            global_without_local, total,
+            low_progress_cost, abs_low_progress_cost, speed_floor_cost, target_speed_cost, excessive_progress_cost,
+            move_gate, global_without_local, total,
         ], axis=1).astype(np.float32)
         return costs, components

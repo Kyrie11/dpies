@@ -461,7 +461,7 @@ BUDGET=16 LIMIT_SCENARIOS=20 bash scripts/run_closed_loop_reactive_idm.sh
 EXTRA_NUPLAN_ARGS="scenario_filter.scenario_types='[nearby_dense_vehicle_traffic]'" \
   LIMIT_SCENARIOS=10 bash scripts/run_closed_loop_reactive_idm.sh
 ```
-
+[论文修改建议.md](../../Download/%E8%AE%BA%E6%96%87%E4%BF%AE%E6%94%B9%E5%BB%BA%E8%AE%AE.md)
 The legacy script names remain available:
 
 ```bash
