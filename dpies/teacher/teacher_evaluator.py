@@ -170,6 +170,7 @@ class TeacherEvaluator:
                 + w.stop_when_should_move * stop_when_should_move_cost
                 + w.target_speed_weight * target_speed_cost
                 + w.hard_comfort * hard_comfort_cost
+                + w.low_progress * abs_low_progress_cost
         )
 
         total = global_without_local + w.local_evidence * local_sum
