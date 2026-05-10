@@ -523,8 +523,29 @@ def query_one(feature: np.ndarray, type_id: int, action: np.ndarray, dt: float =
         q[21] = max(0.0, max_speed - 13.4)
         q[22] = max(q[22], max(0.0, -float(action[-1, 0])))
         if exact_map_rules:
-            _map_rule_exact(q, feature, action, dt, metadata, route_info, use_future_traffic=use_future_traffic,
-                            action_geometry=action_geometry)
+            do_exact = True
+            exact_radius = 30.0
+
+            if rule_code in (
+                    int(MapRuleCode.STOP_LINE),
+                    int(MapRuleCode.TRAFFIC_LIGHT_RED),
+                    int(MapRuleCode.CROSSWALK),
+                    int(MapRuleCode.LANE_BOUNDARY),
+                    int(MapRuleCode.SPEED_LIMIT),
+            ):
+                do_exact = min_dist <= exact_radius
+
+            if do_exact:
+                _map_rule_exact(
+                    q,
+                    feature,
+                    action,
+                    dt,
+                    metadata,
+                    route_info,
+                    use_future_traffic=use_future_traffic,
+                    action_geometry=action_geometry,
+                )
     q[23] = 1.0
     return q
 

@@ -241,16 +241,16 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         "signed_evidence_mask": active.astype(bool),
         "logged_ego_future": logged_future.astype(np.float32),
         "metadata_json": json_bytes(sample_meta),
-        "evidence_metadata_json": json_bytes(evidence_metadata),
-        "route_info_json": json_bytes(map_obj.route_info),
-        "traffic_lights_json": json_bytes({"current": traffic_lights_current, "future": traffic_lights_future}),
-        "action_filter_trace_json": json_bytes(action_filter_trace),
     }
 
-    if getattr(args, "slim_cache", False):
-        sample.pop("evidence_metadata_json", None)
-        sample.pop("route_info_json", None)
-        sample.pop("traffic_lights_json", None)
+    if not getattr(args, "slim_cache", False):
+        sample["evidence_metadata_json"] = json_bytes(evidence_metadata)
+        sample["route_info_json"] = json_bytes(map_obj.route_info)
+        sample["traffic_lights_json"] = json_bytes({
+            "current": traffic_lights_current,
+            "future": traffic_lights_future,
+        })
+        sample["action_filter_trace_json"] = json_bytes(action_filter_trace)
 
     return sample
 
