@@ -41,19 +41,19 @@ class DPIESClosedLoopConfig:
     future_seconds: float = 8.0
     dt: float = 0.5
     max_agents: int = 64
-    agent_radius_m: float = 60.0
+    agent_radius_m: float =80.0
     max_actions: int = 32
-    max_evidence_units: int = 64
-    max_map_polylines: int = 128
+    max_evidence_units: int = 128
+    max_map_polylines: int = 256
     max_map_points: int = 20
-    map_radius_m: float = 50.0
-    top_m: int = 4
-    budget: float = 24.0
+    map_radius_m: float = 80.0
+    top_m: int = 8
+    budget: float = 32.0
     eta_e: float = 0.05
     gamma0: float = 1.0
     device: str = "cuda"
     fallback_on_error: bool = True
-    exact_online_map_query: bool = False
+    exact_online_map_query: bool = True
     enable_timing_debug: bool = True
     progress_rerank_weight: float = 0.03
     comfort_rerank_penalty: float = 5.0
@@ -83,8 +83,11 @@ class DPIESPlannerCore:
     @torch.no_grad()
     def choose_action(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dev_batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        out = self.model(dev_batch)
+        out = self.model.forward_rival(dev_batch)
         pair_mask = make_directed_pair_mask(out["rival_scores"], dev_batch["action_mask"], self.top_m)
+        signed = self.model.signed_evidence_for_pair_mask(dev_batch, out, pair_mask)
+        out["signed_evidence"] = signed.float()
+
         selected = capped_greedy_select_batch(out["signed_evidence"], out["rival_scores"], pair_mask,
                                              dev_batch["evidence_mask"], dev_batch["evidence_cost"],
                                              self.budget, self.eta_e, self.gamma0)
@@ -97,7 +100,7 @@ class DPIESPlannerCore:
             hard_min_weight=self.hard_min_weight,
         )
         pred = q.masked_fill(~dev_batch["action_mask"].bool(), -1e9).argmax(dim=-1)
-        return (pred.detach().cpu(), q.detach().cpu(), selected, pair_mask.detach().cpu())
+        return (pred.detach().cpu(), q.detach().cpu(), selected.detach().cpu(), pair_mask.detach().cpu())
 
 
 class DPIESNuPlanPlanner(AbstractPlanner):  # type: ignore[misc]

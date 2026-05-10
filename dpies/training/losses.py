@@ -122,6 +122,48 @@ def hard_negative_loss(
 
     return torch.stack(losses).mean()
 
+def anti_stall_loss(
+    q_scores: torch.Tensor,
+    batch: dict,
+    min_move_progress: float = 20.0,
+    stall_progress: float = 8.0,
+    min_move_speed: float = 1.0,
+    stall_speed: float = 0.5,
+    margin: float = 1.0,
+) -> torch.Tensor:
+    """Weak auxiliary loss: when teacher oracle clearly moves, prevent model from
+    ranking stop/creep above moving candidates.
+
+    This is not a generic progress prior. It is gated by teacher oracle motion.
+    """
+    q_scores = q_scores.float()
+    actions = batch["actions"].float()
+    action_mask = batch["action_mask"].bool()
+    oracle = batch["oracle_action_index"].long()
+
+    progress = actions[:, :, -1, 0]
+    final_speed = actions[:, :, -1, 3]
+
+    oracle_progress = progress.gather(1, oracle[:, None]).squeeze(1)
+    oracle_speed = final_speed.gather(1, oracle[:, None]).squeeze(1)
+
+    should_move = (oracle_progress >= min_move_progress) & (oracle_speed >= min_move_speed)
+
+    moving = action_mask & (progress >= min_move_progress) & (final_speed >= min_move_speed)
+    stalled = action_mask & ((progress <= stall_progress) | (final_speed <= stall_speed))
+
+    has_move = moving.any(dim=1)
+    has_stall = stalled.any(dim=1)
+    use = should_move & has_move & has_stall
+
+    if not use.any():
+        return q_scores.sum() * 0.0
+
+    neg_large = neg_large_like(q_scores)
+    q_move = q_scores.masked_fill(~moving, neg_large).max(dim=1).values
+    q_stall = q_scores.masked_fill(~stalled, neg_large).max(dim=1).values
+
+    return torch.relu(float(margin) - (q_move[use] - q_stall[use])).mean()
 
 def compute_total_loss(outputs: dict, batch: dict, pair_mask: torch.Tensor, q_scores: torch.Tensor,
                        weights: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -138,13 +180,33 @@ def compute_total_loss(outputs: dict, batch: dict, pair_mask: torch.Tensor, q_sc
         weights.get("teacher_rank_margin_scale", 0.5),
         weights.get("teacher_rank_max_pairs", 256),
     )
+
+    l_anti_stall = anti_stall_loss(
+        q_scores,
+        batch,
+        min_move_progress=weights.get("anti_stall_min_move_progress", 20.0),
+        stall_progress=weights.get("anti_stall_stall_progress", 8.0),
+        min_move_speed=weights.get("anti_stall_min_move_speed", 1.0),
+        stall_speed=weights.get("anti_stall_stall_speed", 0.5),
+        margin=weights.get("anti_stall_margin", 1.0),
+    )
+
     total = (
             weights.get("lambda_scr", 1.0) * l_scr
             + weights.get("lambda_evi", 1.0) * l_evi
             + weights.get("lambda_act", 1.0) * l_act
             + weights.get("lambda_hn", 0.5) * l_hn
             + weights.get("lambda_rank", 1.0) * l_rank
+            + weights.get("lambda_anti_stall", 0.0) * l_anti_stall
     )
-    logs = {"loss": total.detach(), "loss_scr": l_scr.detach(), "loss_evi": l_evi.detach(),
-            "loss_act": l_act.detach(), "loss_hn": l_hn.detach(), "loss_rank": l_rank.detach()}
+
+    logs = {
+        "loss": total.detach(),
+        "loss_scr": l_scr.detach(),
+        "loss_evi": l_evi.detach(),
+        "loss_act": l_act.detach(),
+        "loss_hn": l_hn.detach(),
+        "loss_rank": l_rank.detach(),
+        "loss_anti_stall": l_anti_stall.detach(),
+    }
     return total, logs

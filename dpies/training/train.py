@@ -44,6 +44,58 @@ def decision_outputs_fp32(out: dict) -> dict:
         out["signed_evidence"] = out["signed_evidence"].float()
     return out
 
+def build_train_pair_mask(
+    model_pair_mask: torch.Tensor,
+    batch: dict,
+    cfg: dict,
+) -> torch.Tensor:
+    """Build pair mask used for signed-evidence training.
+
+    During training, do not rely only on model top-M screening, because early
+    screening errors can hide decisive teacher rivals from evidence/q losses.
+
+    Inference still uses pure model top-M.
+    """
+    pair_mask = model_pair_mask.bool()
+
+    if bool(cfg.get("pair_mask_union_with_labels", True)):
+        if "rival_label" in batch:
+            label_mask = batch["rival_label"].bool()
+            k = label_mask.shape[-1]
+            valid = (
+                batch["action_mask"][:, :, None].bool()
+                & batch["action_mask"][:, None, :].bool()
+            )
+            eye = torch.eye(k, dtype=torch.bool, device=label_mask.device)[None]
+            label_mask = label_mask & valid & (~eye)
+            pair_mask = pair_mask | label_mask
+
+    if bool(cfg.get("pair_mask_union_oracle_topk", True)):
+        topk = int(cfg.get("oracle_topk_teacher", 8))
+        teacher_cost = batch["teacher_cost"].float()
+        action_mask = batch["action_mask"].bool()
+        oracle = batch["oracle_action_index"].long()
+        b, k = teacher_cost.shape
+
+        masked_cost = teacher_cost.masked_fill(~action_mask, float("inf"))
+        m = min(max(topk, 1), k)
+        best_idx = torch.topk(masked_cost, k=m, dim=1, largest=False).indices
+
+        oracle_mask = torch.zeros((b, k, k), dtype=torch.bool, device=teacher_cost.device)
+        batch_idx = torch.arange(b, device=teacher_cost.device)[:, None]
+        oracle_expand = oracle[:, None].expand(-1, m)
+
+        # oracle -> top teacher actions
+        oracle_mask[batch_idx, oracle_expand, best_idx] = True
+        # top teacher actions -> oracle, because signed evidence is antisymmetric
+        oracle_mask[batch_idx, best_idx, oracle_expand] = True
+
+        eye = torch.eye(k, dtype=torch.bool, device=teacher_cost.device)[None]
+        valid = action_mask[:, :, None] & action_mask[:, None, :]
+        oracle_mask = oracle_mask & valid & (~eye)
+        pair_mask = pair_mask | oracle_mask
+
+    return pair_mask
 
 def init_distributed() -> tuple[bool, int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
@@ -259,10 +311,14 @@ def main() -> None:
 
             out = decision_outputs_fp32(out)
 
-            pair_mask = make_directed_pair_mask(
+            model_pair_mask = make_directed_pair_mask(
                 out["rival_scores"],
                 batch["action_mask"],
-                int(sel_cfg.get("top_m", 4)),
+                int(sel_cfg.get("top_m", 8)),
+            )
+
+            pair_mask = build_train_pair_mask(
+                model_pair_mask, batch, cfg.get("training", {})
             )
 
             if two_stage_signed_evidence:

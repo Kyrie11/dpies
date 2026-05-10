@@ -57,6 +57,36 @@ def evaluate_budget(model, loader, device, top_m: int, budget: float, eta_e: flo
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - start
         metrics = batch_action_metrics(q, batch["oracle_action_index"], batch["teacher_cost"], batch["action_mask"])
+        pred = q.masked_fill(~batch["action_mask"].bool(), -1e9).argmax(dim=-1)
+
+        actions = batch["actions"].float()
+        progress = actions[:, :, -1, 0]
+        final_speed = actions[:, :, -1, 3]
+
+        pred_progress = progress.gather(1, pred[:, None]).squeeze(1)
+        pred_speed = final_speed.gather(1, pred[:, None]).squeeze(1)
+
+        oracle = batch["oracle_action_index"].long()
+        oracle_progress = progress.gather(1, oracle[:, None]).squeeze(1)
+        oracle_speed = final_speed.gather(1, oracle[:, None]).squeeze(1)
+
+        pred_near_stop = (pred_progress < 8.0) | (pred_speed < 0.5)
+        oracle_moves = (oracle_progress >= 20.0) & (oracle_speed >= 1.0)
+
+        metrics["pred_progress_mean"] = float(pred_progress.mean().item())
+        metrics["pred_final_speed_mean"] = float(pred_speed.mean().item())
+        metrics["pred_near_stop_rate"] = float(pred_near_stop.float().mean().item())
+        metrics["oracle_progress_mean"] = float(oracle_progress.mean().item())
+        metrics["oracle_final_speed_mean"] = float(oracle_speed.mean().item())
+        metrics["oracle_move_rate"] = float(oracle_moves.float().mean().item())
+
+        if oracle_moves.any():
+            metrics["pred_stop_when_oracle_move_rate"] = float(
+                (pred_near_stop & oracle_moves).float().sum().item()
+                / max(float(oracle_moves.float().sum().item()), 1.0)
+            )
+        else:
+            metrics["pred_stop_when_oracle_move_rate"] = 0.0
         metrics["screen_recall_at_m"] = screening_recall_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["screen_precision_at_m"] = screening_precision_at_m(pair_mask, batch["rival_label"], batch["action_mask"])
         metrics["decisive_rival_miss_rate"] = decisive_rival_miss_rate(pair_mask, batch["rival_label"], batch["oracle_action_index"], batch["action_mask"])

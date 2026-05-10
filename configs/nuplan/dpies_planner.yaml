@@ -16,8 +16,10 @@ dpies_planner:
   max_map_polylines: 256
   max_map_points: 20
   map_radius_m: 80.0
-  top_m: 4
+  top_m: 8.0
   budget: 32.0
   eta_e: 0.05
   gamma0: 1.0
+  softmin_tau: 2.0
+  exact_online_map_query: true
   fallback_on_error: true
