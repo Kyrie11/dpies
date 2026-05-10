@@ -9,14 +9,14 @@ from dpies.teacher.local_costs import LocalCostWeights, local_teacher_contributi
 
 @dataclass
 class TeacherWeights:
-    route_progress: float = -18.0
+    route_progress: float = -22.0
     speed_limit: float = 5.0
     comfort_accel: float = 1.0
     comfort_jerk: float = 0.5
     comfort_curvature: float = 0.5
     imitation_ade: float = 0.25
     imitation_fde: float = 0.25
-    local_evidence: float = 0.08
+    local_evidence: float = 0.04
 
     # Relative imitation/progress still matters, but should not be the only
     # signal deciding whether the oracle creeps or moves.
@@ -25,21 +25,21 @@ class TeacherWeights:
 
     # Absolute motion priors.  These are gated by per-action future risk so
     # they discourage unnecessary stop/creep without forcing blind rushing.
-    absolute_progress_floor: float = 22.0
-    absolute_progress_weight: float = 120.0
-    speed_floor: float = 2.5
-    speed_floor_weight: float = 18.0
-    target_speed: float = 7.0
-    target_speed_weight: float = 2.0
-    excessive_progress_cap: float = 70.0
-    excessive_progress: float = 8.0
+    absolute_progress_floor: float = 25.0
+    absolute_progress_weight: float = 180.0
+    speed_floor: float = 3.0
+    speed_floor_weight: float = 30.0
+    target_speed: float = 8.0
+    target_speed_weight: float = 1.5
+    excessive_progress_cap: float = 65.0
+    excessive_progress: float = 12.0
     hard_comfort: float = 8.0
 
-    future_collision: float = 60.0
-    future_proximity: float = 8.0
+    future_collision: float = 80.0
+    future_proximity: float = 6.0
     collision_radius_m: float = 2.2
     proximity_sigma_m: float = 3.0
-    risk_gate_proximity_scale: float = 0.05
+    risk_gate_proximity_scale: float = 0.02
 
 
 class TeacherEvaluator:
@@ -165,7 +165,7 @@ class TeacherEvaluator:
         # Adaptive floor: require moderate progress, but cap the floor so that the
         # teacher does not chase the very aggressive 120m/180m actions.
         base_floor = float(getattr(w, "absolute_progress_floor", 22.0))
-        adaptive_floor = min(35.0, max(base_floor, 0.45 * max_valid_progress))
+        adaptive_floor = min(45.0, max(base_floor, 0.60 * max_valid_progress))
         abs_low_progress_cost = np.maximum(adaptive_floor - action_progress, 0.0) / max(adaptive_floor, 1e-3)
         abs_low_progress_cost = abs_low_progress_cost ** 2
 

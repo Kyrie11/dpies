@@ -6,6 +6,27 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+from dpies.teacher.teacher_evaluator import TeacherWeights
+
+W = TeacherWeights()
+COMPONENT_WEIGHTS = {
+    "ade": W.imitation_ade,
+    "fde": W.imitation_fde,
+    "progress_norm": W.route_progress,
+    "speed_over": W.speed_limit,
+    "accel_cost": W.comfort_accel,
+    "jerk_cost": W.comfort_jerk,
+    "curv_cost": W.comfort_curvature,
+    "future_collision": W.future_collision,
+    "future_proximity": W.future_proximity,
+    "local_sum": W.local_evidence,
+    "rel_low_progress": W.low_progress,
+    "abs_low_progress": W.absolute_progress_weight,
+    "speed_floor": W.speed_floor_weight,
+    "target_speed": W.target_speed_weight,
+    "excessive_progress": W.excessive_progress,
+}
+
 parser = argparse.ArgumentParser(description='Dataset oracle diagnostics')
 parser.add_argument('--CACHE_DIR', type=str, required=True,
                    help='Path to the cache directory containing npz files')
@@ -131,8 +152,14 @@ for idx, p in enumerate(files):
             comp = d["teacher_components"]
             if comp.ndim == 2 and comp.shape[0] > oracle:
                 for j in range(min(comp.shape[1], len(component_names))):
-                    row[f"oracle_comp_{component_names[j]}"] = float(comp[oracle, j])
-                    row[f"maxprog_comp_{component_names[j]}"] = float(comp[max_progress_idx, j])
+                    name = component_names[j]
+                    row[f"oracle_comp_{name}"] = float(comp[oracle, j])
+                    row[f"maxprog_comp_{name}"] = float(comp[max_progress_idx, j])
+                    if name in COMPONENT_WEIGHTS:
+                        wt = float(COMPONENT_WEIGHTS[name])
+                        row[f"oracle_wcomp_{name}"] = wt * float(comp[oracle, j])
+                        row[f"maxprog_wcomp_{name}"] = wt * float(comp[max_progress_idx, j])
+                        row[f"delta_wcomp_{name}"] = wt * (float(comp[max_progress_idx, j]) - float(comp[oracle, j]))
 
         rows.append(row)
 
@@ -200,6 +227,16 @@ comp_cols = [c for c in df.columns if c.startswith("oracle_comp_")]
 if comp_cols:
     print("\nORACLE TEACHER COMPONENTS")
     describe(comp_cols)
+
+wcomp_cols = [c for c in df.columns if c.startswith("oracle_wcomp_")]
+if wcomp_cols:
+    print("\nORACLE WEIGHTED TEACHER COMPONENT CONTRIBUTIONS")
+    describe(wcomp_cols)
+
+delta_cols = [c for c in df.columns if c.startswith("delta_wcomp_")]
+if delta_cols:
+    print("\nMAX-PROGRESS MINUS ORACLE WEIGHTED CONTRIBUTION DELTAS")
+    describe(delta_cols)
 
 # Cases where teacher prefers stop/low-progress despite high-progress available
 sus = df[
