@@ -8,7 +8,8 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
+import time
+from collections import defaultdict
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -50,10 +51,19 @@ def _pad_agents(arr: np.ndarray, mask: np.ndarray, max_agents: int, steps: int) 
         out_mask[:n, :mask.shape[1]] = mask[:n, :steps]
     return out, out_mask
 
+def tick(name: str, start: float) -> float:
+    now = time.perf_counter()
+    if timings is not None:
+        timings[name] += now - start
+    return now
+
+
 
 def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_provider: NuPlanMapProvider,
                 action_gen: ActionGenerator, evidence_builder: EvidenceBuilder,
-                teacher: TeacherEvaluator, scenario_extractor: ScenarioAPIExtractor | None = None) -> Dict[str, np.ndarray] | None:
+                teacher: TeacherEvaluator, scenario_extractor: ScenarioAPIExtractor | None = None,
+                timings: dict[str, float] | None = None) -> Dict[str, np.ndarray] | None:
+    t = time.perf_counter()
     center_us = int(lidar_row["timestamp_us"])
     current = db.ego_state_at_lidar_row(lidar_row)
     if current is None:
@@ -88,6 +98,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         agent_track_id[i] = stable_int(tok)
         if i < current_agents.shape[0]:
             agent_type[i] = int(current_agents[i, 7])
+    t = tick("db_history_agents_s", t)
 
     meta = db.get_log_metadata()
     map_name = str(meta.get("map_name", "unknown"))
@@ -98,6 +109,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         if getattr(args, "use_future_traffic_labels", False)
         else []
     )
+    t = tick("traffic_s", t)
     scenario_ctx = None
     if scenario_extractor is not None and scenario_extractor.available:
         scenario_ctx = scenario_extractor.extract_for_lidar_row(db.db_path, lidar_row, map_name, args.future_seconds, fut_steps)
@@ -133,7 +145,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         if args.continue_on_error:
             return None
         raise RuntimeError(f"required map extraction failed: {map_obj.error}")
-
+    t = tick("map_extract_s", t)
     actions, action_meta, action_mask = action_gen.generate(
         ego_history,
         agent_history=agent_history,
@@ -146,6 +158,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
 
     if not action_mask.any():
         return None
+    t = tick("action_gen_s", t)
 
     ade, fde = min_ade_fde(actions, action_mask, logged_future)
 
@@ -163,17 +176,20 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         dt=args.dt, agent_history_mask=agent_history_mask,
     )
     evidence_metadata = list(evidence_builder.last_metadata)
+    t = tick("evidence_build_s", t)
     geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
         exact_map_rules=getattr(args, "exact_input_map_query", False),
     )
+    t = tick("input_geometry_query_s", t)
     teacher_geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         future_agents=agent_future, future_agent_mask=agent_future_mask, evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
         use_future_traffic=getattr(args, "use_future_traffic_labels", False),
         exact_map_rules=getattr(args, "teacher_exact_map_query", False),
     )
+    t = tick("teacher_geometry_query_s", t)
     local_cost = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query, evidence_mask, action_mask)
     teacher_cost, teacher_components = teacher.evaluate_with_components(
         actions, action_mask, logged_future, agent_future, agent_mask,
@@ -185,6 +201,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     signed = signed_evidence_labels(local_cost, action_mask, args.s_max)
     active = signed_evidence_active_mask(local_cost, teacher_geometry_query, action_mask, evidence_mask,
                                          args.active_cost_threshold, args.active_query_threshold)
+    t = tick("teacher_label", s)
     ade, fde = min_ade_fde(actions, action_mask, logged_future)
     local_sum = local_cost.sum(axis=0).astype(np.float32)
     sample_meta = {
@@ -330,13 +347,19 @@ def main() -> None:
                 results.append(fut.result())
 
     manifest_rows = []
+
     failures = 0
     num_samples = 0
-
+    timing_sums = defaultdict(float)
+    timing_samples = 0
     for r in results:
         failures += int(r["failures"])
         num_samples += int(r["written"])
         manifest_rows.extend(r["manifest_rows"])
+
+        for k, v in r.get("timings", {}).items():
+            timing_sums[k] += float(v)
+        timing_samples += int(r.get("timed_samples", 0))
 
     with open(out_dir / "manifest.jsonl", "w", encoding="utf-8") as f:
         for row in manifest_rows:
@@ -346,6 +369,11 @@ def main() -> None:
         "num_samples": num_samples,
         "num_failures": failures,
         "num_dbs": len(db_files),
+        "timing_total_s": dict(timing_sums),
+        "timing_s_per_sample": {
+            k: v/max(timing_samples, 1)
+            for k, v in timing_sums.items()
+        }
     })
 
 def db_output_name(db_path: Path) -> str:
@@ -395,7 +423,8 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
     written = 0
     failures = 0
     manifest_rows = []
-
+    timings = defaultdict(float)
+    timed_samples = 0
     try:
         with NuPlanSQLite(db_path) as db:
             if args.create_sqlite_indexes:
@@ -423,6 +452,7 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
                         evidence_builder,
                         teacher,
                         scenario_extractor,
+                        timings=timings
                     )
                     if sample is None:
                         continue
@@ -433,6 +463,7 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
                     meta["file"] = str(Path(db_path.stem) / name)
                     manifest_rows.append(meta)
                     written += 1
+                    timed_samples += 1
 
                     # if args.max_samples_total is not None and written >= args.max_samples_total:
                     #     break
@@ -455,6 +486,8 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
         "written": written,
         "failures": failures,
         "manifest_rows": manifest_rows,
+        "timings": dict(timings),
+        "timed_samples": timed_samples
     }
 
 def safe_json_scalar(value: object) -> dict:
