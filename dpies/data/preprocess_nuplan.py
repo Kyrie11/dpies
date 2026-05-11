@@ -279,10 +279,26 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     return sample
 
 def save_sample(path: Path, sample: Dict[str, np.ndarray], compress: bool = False) -> None:
-    if compress:
-        np.savez_compressed(path, **sample)
-    else:
-        np.savez(path, **sample)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp.npz")
+    try:
+        if compress:
+            np.savez_compressed(tmp, **sample)
+        else:
+            np.savez(tmp, **sample)
+
+        # 立刻验证一次，避免坏文件进入 cache。
+        with np.load(tmp, allow_pickle=False) as z:
+            for k in z.files:
+                _ = z[k]
+
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 def json_bytes(obj: object) -> np.ndarray:
     return np.asarray(json.dumps(obj, ensure_ascii=False).encode("utf-8"), dtype=np.bytes_)
