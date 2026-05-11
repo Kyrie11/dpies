@@ -100,7 +100,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         if i < current_agents.shape[0]:
             agent_type[i] = int(current_agents[i, 7])
     t = tick("db_history_agents_s", t)
-
+    print(t)
     meta = db.get_log_metadata()
     map_name = str(meta.get("map_name", "unknown"))
     route_roadblock_ids = db.route_roadblock_ids_for_lidar_token(lidar_row["token"])
@@ -111,6 +111,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         else []
     )
     t = tick("traffic_s", t)
+    print(t)
     scenario_ctx = None
     if scenario_extractor is not None and scenario_extractor.available:
         scenario_ctx = scenario_extractor.extract_for_lidar_row(db.db_path, lidar_row, map_name, args.future_seconds, fut_steps)
@@ -147,6 +148,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
             return None
         raise RuntimeError(f"required map extraction failed: {map_obj.error}")
     t = tick("map_extract_s", t)
+    print(t)
     actions, action_meta, action_mask = action_gen.generate(
         ego_history,
         agent_history=agent_history,
@@ -160,7 +162,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     if not action_mask.any():
         return None
     t = tick("action_gen_s", t)
-
+    print(t)
     ade, fde = min_ade_fde(actions, action_mask, logged_future)
 
     if not getattr(args, "keep_bad_action_coverage", False):
@@ -178,12 +180,14 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     )
     evidence_metadata = list(evidence_builder.last_metadata)
     t = tick("evidence_build_s", t)
+    print(t)
     geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
         exact_map_rules=getattr(args, "exact_input_map_query", False),
     )
     t = tick("input_geometry_query_s", t)
+    print(t)
     teacher_geometry_query = compute_geometry_query(
         evidence_features, evidence_type, actions, evidence_mask, action_mask, args.dt,
         future_agents=agent_future, future_agent_mask=agent_future_mask, evidence_metadata=evidence_metadata, route_info=map_obj.route_info,
@@ -191,6 +195,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
         exact_map_rules=getattr(args, "teacher_exact_map_query", False),
     )
     t = tick("teacher_geometry_query_s", t)
+    print(t)
     local_cost = local_teacher_contribution(evidence_features, evidence_type, teacher_geometry_query, evidence_mask, action_mask)
     teacher_cost, teacher_components = teacher.evaluate_with_components(
         actions, action_mask, logged_future, agent_future, agent_mask,
@@ -203,6 +208,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     active = signed_evidence_active_mask(local_cost, teacher_geometry_query, action_mask, evidence_mask,
                                          args.active_cost_threshold, args.active_query_threshold)
     t = tick("teacher_label", t)
+    print(t)
     ade, fde = min_ade_fde(actions, action_mask, logged_future)
     local_sum = local_cost.sum(axis=0).astype(np.float32)
     sample_meta = {
@@ -346,7 +352,6 @@ def main() -> None:
             futs = [ex.submit(process_one_db_worker, (str(p), args_dict)) for p in db_files]
             for fut in tqdm(as_completed(futs), total=len(futs), desc="db"):
                 results.append(fut.result())
-    print("one process")
     manifest_rows = []
 
     failures = 0
