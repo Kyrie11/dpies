@@ -466,7 +466,7 @@ def process_one_db_worker(payload: tuple[str, dict]) -> dict:
                     save_sample(out_path, sample, args.compress)
 
                     meta = safe_json_scalar(sample["metadata_json"])
-                    meta["file"] = str(Path(db_path.stem) / name)
+                    meta["file"] = str(Path(db_name) / name)
                     manifest_rows.append(meta)
                     written += 1
                     timed_samples += 1
