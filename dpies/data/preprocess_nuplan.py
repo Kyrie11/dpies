@@ -51,11 +51,7 @@ def _pad_agents(arr: np.ndarray, mask: np.ndarray, max_agents: int, steps: int) 
         out_mask[:n, :mask.shape[1]] = mask[:n, :steps]
     return out, out_mask
 
-def tick(name: str, start: float) -> float:
-    now = time.perf_counter()
-    if timings is not None:
-        timings[name] += now - start
-    return now
+
 
 
 
@@ -63,6 +59,11 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
                 action_gen: ActionGenerator, evidence_builder: EvidenceBuilder,
                 teacher: TeacherEvaluator, scenario_extractor: ScenarioAPIExtractor | None = None,
                 timings: dict[str, float] | None = None) -> Dict[str, np.ndarray] | None:
+    def tick(name: str, start: float) -> float:
+        now = time.perf_counter()
+        if timings is not None:
+            timings[name] += now - start
+        return now
     t = time.perf_counter()
     center_us = int(lidar_row["timestamp_us"])
     current = db.ego_state_at_lidar_row(lidar_row)
