@@ -202,7 +202,7 @@ def make_sample(db: NuPlanSQLite, lidar_row: Any, args: argparse.Namespace, map_
     signed = signed_evidence_labels(local_cost, action_mask, args.s_max)
     active = signed_evidence_active_mask(local_cost, teacher_geometry_query, action_mask, evidence_mask,
                                          args.active_cost_threshold, args.active_query_threshold)
-    t = tick("teacher_label", s)
+    t = tick("teacher_label", t)
     ade, fde = min_ade_fde(actions, action_mask, logged_future)
     local_sum = local_cost.sum(axis=0).astype(np.float32)
     sample_meta = {
