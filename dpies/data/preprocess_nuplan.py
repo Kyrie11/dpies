@@ -346,7 +346,7 @@ def main() -> None:
             futs = [ex.submit(process_one_db_worker, (str(p), args_dict)) for p in db_files]
             for fut in tqdm(as_completed(futs), total=len(futs), desc="db"):
                 results.append(fut.result())
-
+    print("one process")
     manifest_rows = []
 
     failures = 0
