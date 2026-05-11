@@ -332,7 +332,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_pe
  --override \
     training.epochs=20 \
     training.log_interval=10 \
-    data.batch_size=12 \[added_refs.bib]
+    data.batch_size=12 \
     data.num_workers=8 \
     data.prefetch_factor=2 \
     training.mixed_precision=true \
