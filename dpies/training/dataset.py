@@ -22,7 +22,14 @@ BOOL_KEYS = {
     "evidence_mask", "rival_label", "signed_evidence_mask",
 }
 LONG_KEYS = {"evidence_type", "oracle_action_index", "agent_track_id", "agent_type"}
-STRING_KEYS = {"metadata_json", "evidence_metadata_json", "evidence_units_json", "route_info_json", "traffic_lights_json"}
+STRING_KEYS = {
+    "metadata_json",
+    "evidence_metadata_json",
+    "evidence_units_json",
+    "route_info_json",
+    "traffic_lights_json",
+    "action_filter_trace_json",
+}
 
 
 def _upgrade_ego_history(arr: np.ndarray) -> np.ndarray:
@@ -81,5 +88,7 @@ class EvidenceCacheDataset(Dataset):
         if "agent_future_mask" not in out and "agent_future" in out and "agent_mask" in out:
             t = out["agent_future"].shape[1]
             out["agent_future_mask"] = out["agent_mask"][:, None].expand(-1, t).clone()
+        for k in STRING_KEYS:
+            out.setdefault(k, "")
         out["cache_file"] = str(self.files[idx])
         return out
